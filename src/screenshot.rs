@@ -61,8 +61,17 @@ pub fn capture(window: &str, region: &str, scale: f64) -> Result<(Vec<u8>, Value
         base_scale = mon.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
     }
 
-    // Apply explicit scale if given (grim -s)
+    // Default to JPEG q85 for 3x smaller transfer vs PNG (vision bottleneck)
+    // Keep PNG only if caller explicitly wants it via env HYPRFAST_PNG=1
+    let use_png = std::env::var("HYPRFAST_PNG").is_ok();
     let mut cmd_args = Vec::new();
+    if !use_png {
+        cmd_args.push("-t".to_string());
+        cmd_args.push("jpeg".to_string());
+        cmd_args.push("-q".to_string());
+        cmd_args.push("85".to_string());
+    }
+    // Apply explicit scale if given (grim -s)
     if scale != 0.0 && (scale-1.0).abs()>1e-6 {
         cmd_args.push("-s".to_string());
         cmd_args.push(format!("{}",(base_scale*scale)));

@@ -76,18 +76,20 @@ hyprfast handles WhatsApp Web via keyboard chords through `keyboard action=key k
 
 ### Canonical flows
 
-**Send `hello` to `Khushi` (Web):**
+**Send `hello` to `Khushi` (Web) — no screenshot needed (keyboard-only, ~0.8s):**
 ```json
 {"tool":"desktop"}
 → {"tool":"hypr","action":"focus_window","target":"0x...brave..."}
 → {"tool":"keyboard","action":"key","keys":"ctrl+alt+slash","window":"0x..."}
 → {"tool":"keyboard","action":"type","text":"Khushi","window":"0x..."}
 → {"tool":"keyboard","action":"key","keys":"enter","window":"0x..."}
-→ wait 1s or {"tool":"wait_for","event":"title_change","match":"Khushi"}
+→ wait 0.8s (chat opens)
 → {"tool":"keyboard","action":"type","text":"hello","window":"0x..."}
 → {"tool":"keyboard","action":"key","keys":"enter","window":"0x..."}
-→ {"tool":"screenshot","window":"0x..."} // confirm sent
+→ done — no screenshot needed. Only screenshot if you need visual confirm: {"tool":"screenshot","window":"0x...","scale":0.5} // fast JPEG 0.5x ~80KB, or HYPRFAST_PNG=1 for PNG
 ```
+
+**Perf note:** `screenshot` is fallback only. `src/screenshot.rs:64` now defaults to `grim -t jpeg -q 85` (~80KB vs ~250KB PNG, 3× less vision tokens). Native apps use `ui`/`click_ui` zbus `9-13ms` no image at all. For WhatsApp Web in Brave, keyboard is `~50ms` per key vs `2-4s` vision loop — prefer keyboard.
 
 **Archive / Pin / Mute the active chat:** focus window → `keyboard key` with chord above.
 
