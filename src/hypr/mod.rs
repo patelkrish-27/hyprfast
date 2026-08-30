@@ -34,25 +34,10 @@ pub fn query_json(cmd: &str) -> Result<Value> {
     serde_json::from_str(&raw).context("parse hypr json")
 }
 
-pub fn eval_lua(code: &str) -> Result<String> {
-    // Hyprland 0.56: dispatch is lua hl.dispatch(hl.dsp.*)
-    let out = std::process::Command::new("hyprctl").args(["eval", code]).output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if !out.status.success() && !stdout.contains("ok") {
-        // hyprctl eval returns ok even on lua error? check stderr
-        if stderr.contains("error") || stdout.contains("error") {
-            anyhow::bail!("eval {}: {} {}", code, stdout, stderr);
-        }
-    }
-    if stdout.contains("error") {
-        anyhow::bail!("eval {}: {}", code, stdout);
-    }
-    Ok(stdout.trim().to_string())
-}
-
 pub fn dispatch(cmd: &str, args: &str) -> Result<String> {
-    // Hyprland 0.56+ uses lua dsp; try new path first
+    // Hyprland 0.56: dispatch is lua hl.dispatch(hl.dsp.*) via `j/eval`.
+    // Direct socket `dispatch workspace 1` is deprecated (returns lua error).
+    // We use raw Unix socket `j/eval return hl.dispatch(...)` — no hyprctl fork (~1ms vs 15ms).
     let lua = match (cmd, args) {
         ("workspace", ws) => format!("return hl.dispatch(hl.dsp.focus({{workspace=\"{}\"}}))", ws),
         ("focuswindow", addr) => {
@@ -60,19 +45,14 @@ pub fn dispatch(cmd: &str, args: &str) -> Result<String> {
             format!("return hl.dispatch(hl.dsp.focus({{window=\"address:{}\"}}))", a)
         },
         ("movetoworkspacesilent", arg) => {
-            // arg like "3,address:0x..."
             let parts: Vec<&str> = arg.split(',').collect();
-            if parts.len()==2 {
+            if parts.len()==2 && parts[1].starts_with("address:") {
                 let ws = parts[0];
-                // move active window; for specific window we focus first
-                if parts[1].starts_with("address:") {
-                    let a = parts[1].strip_prefix("address:").unwrap();
-                    // focus then move
-                    let _ = eval_lua(&format!("return hl.dispatch(hl.dsp.focus({{window=\"{}\"}}))", a));
-                    format!("return hl.dispatch(hl.dsp.window.move({{workspace=\"{}\"}}))", ws)
-                } else {
-                    format!("return hl.dispatch(hl.dsp.window.move({{workspace=\"{}\"}}))", ws)
-                }
+                let a = parts[1].strip_prefix("address:").unwrap();
+                // focus then move via two evals in one lua block
+                format!("hl.dispatch(hl.dsp.focus({{window=\"address:{}\"}})); return hl.dispatch(hl.dsp.window.move({{workspace=\"{}\"}}))", a, ws)
+            } else if parts.len()==2 {
+                format!("return hl.dispatch(hl.dsp.window.move({{workspace=\"{}\"}}))", parts[0])
             } else {
                 format!("return hl.dispatch(hl.dsp.window.move({{workspace=\"{}\"}}))", args)
             }
@@ -80,12 +60,13 @@ pub fn dispatch(cmd: &str, args: &str) -> Result<String> {
         ("closewindow", addr) => {
             let a = addr.strip_prefix("address:").unwrap_or(addr);
             if !a.is_empty() {
-                let _ = eval_lua(&format!("return hl.dispatch(hl.dsp.focus({{window=\"{}\"}}))", a));
+                format!("hl.dispatch(hl.dsp.focus({{window=\"address:{}\"}})); return hl.dispatch(hl.dsp.window.close())", a)
+            } else {
+                "return hl.dispatch(hl.dsp.window.close())".to_string()
             }
-            format!("return hl.dispatch(hl.dsp.window.close())")
         },
-        ("fullscreen", _) => format!("return hl.dispatch(hl.dsp.window.fullscreen({{mode=\"fullscreen\"}}))"),
-        ("togglefloating", _) => format!("return hl.dispatch(hl.dsp.window.float({{action=\"toggle\"}}))"),
+        ("fullscreen", _) => "return hl.dispatch(hl.dsp.window.fullscreen({mode=\"fullscreen\"}))".to_string(),
+        ("togglefloating", _) => "return hl.dispatch(hl.dsp.window.float({action=\"toggle\"}))".to_string(),
         ("movecursor", arg) => {
             let mut it = arg.split_whitespace();
             let x = it.next().unwrap_or("0");
@@ -94,14 +75,18 @@ pub fn dispatch(cmd: &str, args: &str) -> Result<String> {
         },
         ("exec", c) => format!("return hl.dispatch(hl.dsp.exec_cmd({:?}))", c),
         _ => {
-            // fallback to old socket dispatch for unknown
             let req = if args.is_empty() { format!("dispatch {}", cmd) } else { format!("dispatch {} {}", cmd, args) };
             let out = hypr_request(&req)?;
             if out.contains("error") { anyhow::bail!("dispatch {} {}: {}", cmd, args, out); }
             return Ok(out.trim().to_string());
         }
     };
-    eval_lua(&lua)
+    let out = hypr_request(&format!("j/eval {}", lua))?;
+    let trimmed = out.trim();
+    if trimmed.contains("error") {
+        anyhow::bail!("eval {}: {}", lua, trimmed);
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Batched snapshot - one socket write, one read, parse multiple JSON docs.

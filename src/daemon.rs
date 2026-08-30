@@ -142,13 +142,15 @@ pub async fn run_daemon() -> Result<()> {
     }
 }
 
+static DAEMON_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+fn daemon_rt() -> &'static tokio::runtime::Runtime {
+    DAEMON_RT.get_or_init(|| tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt"))
+}
 // Client helpers — try daemon first, fallback to direct
 pub fn client_snapshot() -> Result<Value> {
     let path = daemon_path();
     if !path.exists() { return crate::hypr::snapshot(); }
-    // Sync client via blocking
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(async {
+    daemon_rt().block_on(async {
         let mut stream = UnixStream::connect(&path).await.context("connect daemon")?;
         let req = json!({"method":"desktop"});
         stream.write_all((serde_json::to_string(&req)? + "\n").as_bytes()).await?;
@@ -164,8 +166,7 @@ pub fn client_snapshot() -> Result<Value> {
 pub fn client_wait_for(event: &str, m: &str, timeout: f64) -> Result<Value> {
     let path = daemon_path();
     if !path.exists() { return crate::events::wait_for_direct(event, m, timeout); }
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(async {
+    daemon_rt().block_on(async {
         let mut stream = UnixStream::connect(&path).await.context("connect daemon")?;
         let req = json!({"method":"wait_for","event":event,"match":m,"timeout":timeout});
         stream.write_all((serde_json::to_string(&req)? + "\n").as_bytes()).await?;

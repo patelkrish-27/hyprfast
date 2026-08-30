@@ -5,6 +5,7 @@
 use anyhow::{Result, bail, Context};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use zbus::{Connection, Proxy, zvariant::OwnedObjectPath};
 
 const COORD_WINDOW: u32 = 1;
@@ -23,22 +24,37 @@ const VALUE_ROLES: &[i32] = &[51,52];
 const MAX_TEXT: i32 = 200;
 const EXTENT_SANITY: i32 = 20000;
 
-fn actionable_set() -> HashSet<i32> { ACTIONABLE_ROLES.iter().cloned().collect() }
-fn checkable_set() -> HashSet<i32> { CHECKABLE_ROLES.iter().cloned().collect() }
-fn text_set() -> HashSet<i32> { TEXT_ROLES.iter().cloned().collect() }
-fn value_set() -> HashSet<i32> { VALUE_ROLES.iter().cloned().collect() }
+static ACTIONABLE_SET: OnceLock<HashSet<i32>> = OnceLock::new();
+static CHECKABLE_SET: OnceLock<HashSet<i32>> = OnceLock::new();
+static TEXT_SET: OnceLock<HashSet<i32>> = OnceLock::new();
+static VALUE_SET: OnceLock<HashSet<i32>> = OnceLock::new();
+static A11Y_ADDR_CACHE: OnceLock<String> = OnceLock::new();
+static A11Y_CONN_CACHE: OnceLock<Connection> = OnceLock::new();
+static GLOBAL_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn global_rt() -> &'static tokio::runtime::Runtime {
+    GLOBAL_RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("rt"))
+}
+fn actionable_set() -> &'static HashSet<i32> { ACTIONABLE_SET.get_or_init(|| ACTIONABLE_ROLES.iter().cloned().collect()) }
+fn checkable_set() -> &'static HashSet<i32> { CHECKABLE_SET.get_or_init(|| CHECKABLE_ROLES.iter().cloned().collect()) }
+fn text_set() -> &'static HashSet<i32> { TEXT_SET.get_or_init(|| TEXT_ROLES.iter().cloned().collect()) }
+fn value_set() -> &'static HashSet<i32> { VALUE_SET.get_or_init(|| VALUE_ROLES.iter().cloned().collect()) }
 
 async fn a11y_bus_address() -> Result<String> {
+    if let Some(cached) = A11Y_ADDR_CACHE.get() { return Ok(cached.clone()); }
     let conn = Connection::session().await.context("session bus")?;
     let proxy = Proxy::new(&conn, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus").await?;
     let addr: String = proxy.call("GetAddress", &()).await.context("GetAddress")?;
     if addr.is_empty() { bail!("a11y bus reported no address"); }
+    let _ = A11Y_ADDR_CACHE.set(addr.clone());
     Ok(addr)
 }
 
 async fn a11y_connection() -> Result<Connection> {
+    if let Some(conn) = A11Y_CONN_CACHE.get() { return Ok(conn.clone()); }
     let addr = a11y_bus_address().await?;
     let conn = zbus::connection::Builder::address(addr.as_str())?.build().await.context("a11y bus connect")?;
+    let _ = A11Y_CONN_CACHE.set(conn.clone());
     Ok(conn)
 }
 
@@ -211,7 +227,7 @@ fn clickable_now(states: &HashSet<usize>) -> bool {
 async fn find_elements_inner(conn: &Connection, app_svc: &str, app_path: &str, name_filter: &str, actionable: bool) -> (Vec<Value>, bool) {
     let needle = name_filter.to_lowercase();
     let actionable_set = actionable_set();
-    let value_bearing: HashSet<i32> = checkable_set().union(&text_set()).cloned().collect::<HashSet<_>>().union(&value_set()).cloned().collect();
+    let value_bearing: HashSet<i32> = checkable_set().union(text_set()).cloned().collect::<HashSet<_>>().union(value_set()).cloned().collect();
     let mut results = Vec::new();
     let mut stack = vec![(app_svc.to_string(), app_path.to_string())];
     let mut visited = 0;
@@ -295,60 +311,75 @@ pub async fn list_elements_zbus(window: &str, name: &str) -> Result<Value> {
 }
 
 pub async fn click_by_name_zbus(window: &str, name: &str) -> Result<Value> {
-    let els = list_elements_zbus(window, name).await?;
-    let arr = els.get("elements").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    if arr.is_empty() {
-        if let Some(n)=els.get("note").and_then(|v| v.as_str()) { bail!("{}", n); }
-        bail!("no elements matching {:?}", name);
-    }
-    let exact: Vec<_> = arr.iter().filter(|e| e.get("name").and_then(|v| v.as_str()).map(|s| s.to_lowercase()==name.to_lowercase()).unwrap_or(false)).collect();
-    let pool: Vec<&Value> = if !exact.is_empty() { exact } else { arr.iter().collect() };
-    if pool.len()>1 {
-        return Ok(serde_json::json!({"ambiguous": true, "candidates": pool, "hint": "use more specific name"}));
-    }
-    let target = pool[0];
-    let x = target.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
-    let y = target.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
-    // Try DoAction via zbus
+    // Single walk: list then DoAction on same elements, no second walk
     let clients: Value = crate::hypr::query_json("clients")?;
     let active: Value = crate::hypr::query_json("activewindow")?;
-    let t = if window.is_empty() || window=="active" { active.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string() } else { window.to_string() };
-    let client = clients.as_array().and_then(|a| a.iter().find(|c| c.get("address").and_then(|v| v.as_str())==Some(t.as_str()))).cloned();
-    if let Some(c)=client {
-        let pid = c.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let title = c.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let addr = c.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let _ = crate::hypr::eval_lua(&format!("return hl.dispatch(hl.dsp.focus({{window=\"address:{}\"}}))", addr));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Try DoAction
-        let conn = a11y_connection().await?;
-        if let Some(app) = app_for_pid(&conn, pid, title).await {
-            let frame = window_frame(&conn, &app.0, &app.1, title, None).await;
-            let (els,_)=find_elements_inner(&conn, &frame.0, &frame.1, name, true).await;
-            let exact2: Vec<_>=els.iter().filter(|e| e.get("name").and_then(|v| v.as_str()).map(|s| s.to_lowercase()==name.to_lowercase()).unwrap_or(false)).collect();
-            let pool2: Vec<&Value> = if !exact2.is_empty() { exact2 } else { els.iter().collect()};
-            if pool2.len()==1 {
-                let svc = pool2[0].get("svc").and_then(|v| v.as_str()).unwrap_or("");
-                let path = pool2[0].get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let proxy = Proxy::new(&conn, svc, path, "org.a11y.atspi.Action").await?;
-                let ok: bool = proxy.call("DoAction", &(0,)).await.unwrap_or(false);
-                if ok {
-                    return Ok(serde_json::json!({"clicked": true, "x": x, "y": y, "via": "DoAction"}));
-                }
-            }
+    let target_addr = if window.is_empty() || window=="active" { active.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string() } else { window.to_string() };
+    if target_addr.is_empty() { bail!("no active window"); }
+    let client = clients.as_array().and_then(|a| a.iter().find(|c| c.get("address").and_then(|v| v.as_str())==Some(target_addr.as_str()))).ok_or_else(|| anyhow::anyhow!("window {} not found", target_addr))?.clone();
+    let pid = client.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let title = client.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let cls = client.get("class").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let size = client.get("size").and_then(|v| v.as_array()).and_then(|a| Some((a[0].as_i64()? as i32, a[1].as_i64()? as i32)));
+    let at = client.get("at").and_then(|v| v.as_array()).map(|a| (a[0].as_i64().unwrap_or(0) as i32, a[1].as_i64().unwrap_or(0) as i32)).unwrap_or((0,0));
+    let aw = client.get("size").and_then(|v| v.as_array()).map(|a| (a[0].as_i64().unwrap_or(0) as i32, a[1].as_i64().unwrap_or(0) as i32)).unwrap_or((0,0));
+    let conn = a11y_connection().await?;
+    let app = app_for_pid(&conn, pid, &title).await.ok_or_else(|| anyhow::anyhow!("{} exposes no accessibility tree; use screenshot", cls))?;
+    let frame = window_frame(&conn, &app.0, &app.1, &title, size).await;
+    let (raw_els, truncated) = find_elements_inner(&conn, &frame.0, &frame.1, name, true).await;
+    // Map to global coords and keep svc/path for DoAction
+    let mut mapped: Vec<(Value,String,String,i64,i64)> = Vec::new();
+    for e in raw_els {
+        let ext = match e.get("extent").and_then(|v| v.as_array()) { Some(a)=>a, None=>continue };
+        let ex = ext[0].as_i64().unwrap() as i32;
+        let ey = ext[1].as_i64().unwrap() as i32;
+        let ew = ext[2].as_i64().unwrap() as i32;
+        let eh = ext[3].as_i64().unwrap() as i32;
+        let x = at.0 + ex + ew/2;
+        let y = at.1 + ey + eh/2;
+        if !(at.0 <= x && x < at.0+aw.0 && at.1 <= y && y < at.1+aw.1) { continue; }
+        let svc = e.get("svc").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut item = serde_json::json!({
+            "role": e.get("role").cloned().unwrap_or(Value::String("".into())),
+            "name": e.get("name").cloned().unwrap_or(Value::String("".into())),
+            "x": x, "y": y,
+            "clickable": e.get("clickable").cloned().unwrap_or(Value::Bool(false)),
+        });
+        for k in ["value","percent","checked"] { if let Some(v)=e.get(k) { item[k]=v.clone(); } }
+        mapped.push((item, svc, path, x as i64, y as i64));
+    }
+    if mapped.is_empty() {
+        let what = if name.is_empty() { "actionable".to_string() } else { format!("matching {:?}", name) };
+        let tail = if truncated { " (truncated)"} else {""};
+        bail!("no {} elements in {}{}", what, cls, tail);
+    }
+    // Ambiguity check: exact name first
+    let exact: Vec<usize> = mapped.iter().enumerate().filter(|(_, (item,_,_,_,_))| item.get("name").and_then(|v| v.as_str()).map(|s| s.to_lowercase()==name.to_lowercase()).unwrap_or(false)).map(|(i,_)| i).collect();
+    let pool: Vec<usize> = if !exact.is_empty() { exact } else { (0..mapped.len()).collect() };
+    if pool.len()>1 {
+        let candidates: Vec<Value> = pool.iter().map(|i| mapped[*i].0.clone()).collect();
+        return Ok(serde_json::json!({"ambiguous": true, "candidates": candidates, "hint": "use more specific name"}));
+    }
+    let idx = pool[0];
+    let (_target_item, svc, path, x, y) = (&mapped[idx].0, &mapped[idx].1, &mapped[idx].2, mapped[idx].3 as f64, mapped[idx].4 as f64);
+    // Focus window via direct dispatch (no hyprctl fork)
+    let _ = crate::hypr::dispatch("focuswindow", &format!("address:{}", target_addr));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    if !svc.is_empty() && !path.is_empty() {
+        if let Ok(proxy) = Proxy::new(&conn, svc.as_str(), path.as_str(), "org.a11y.atspi.Action").await {
+            let ok: bool = proxy.call("DoAction", &(0,)).await.unwrap_or(false);
+            if ok { return Ok(serde_json::json!({"clicked": true, "x": x, "y": y, "via": "DoAction"})); }
         }
     }
-    // fallback pointer
     crate::input::click(Some(x), Some(y), "left", false)?;
     Ok(serde_json::json!({"clicked": true, "x": x, "y": y, "via": "pointer"}))
 }
 
-// Sync wrappers for non-async callers
+// Sync wrappers for non-async callers — reuse global runtime (<1ms vs 3ms)
 pub fn list_elements_zbus_sync(window: &str, name: &str) -> Result<Value> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(list_elements_zbus(window, name))
+    global_rt().block_on(list_elements_zbus(window, name))
 }
 pub fn click_by_name_zbus_sync(window: &str, name: &str) -> Result<Value> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(click_by_name_zbus(window, name))
+    global_rt().block_on(click_by_name_zbus(window, name))
 }

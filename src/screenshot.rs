@@ -95,10 +95,10 @@ pub fn capture(window: &str, region: &str, scale: f64) -> Result<(Vec<u8>, Value
     Ok((out.stdout, meta))
 }
 
+static REGION_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 fn parse_region(s: &str) -> Result<(i32,i32,i32,i32)> {
-    // accept x,y,WxH or x,y WxH
     let s = s.trim();
-    let re = regex::Regex::new(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*[, ]\s*(\d+)\s*x\s*(\d+)\s*$").unwrap();
+    let re = REGION_RE.get_or_init(|| regex::Regex::new(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*[, ]\s*(\d+)\s*x\s*(\d+)\s*$").unwrap());
     let caps = re.captures(s).ok_or_else(|| anyhow::anyhow!("bad region {}", s))?;
     Ok((caps[1].parse()?, caps[2].parse()?, caps[3].parse()?, caps[4].parse()?))
 }
