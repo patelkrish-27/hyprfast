@@ -20,7 +20,9 @@ Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `poi
 | Click by name via `DoAction` | `click_ui name="OK" window=0x...` / `hyprfast click OK --window 0x...` |
 | Mouse | `pointer action=move x=600 y=400` / `hyprfast pointer move --x 600 --y 400` |
 | Keyboard (focuses `window` first) | `keyboard action=type text="hello" window=0x...` / `hyprfast keyboard type --text hello --window 0x...` ; `action=key keys="ctrl+k"` |
-| Screenshot (fallback) | `screenshot window=0x...` / `hyprfast screenshot --window active` |
+| Screenshot (fallback, auto-tracked) | `screenshot window=0x...` / `hyprfast screenshot --window active` // every shot auto-appended to session list |
+| Clear screenshots (after task success) | `clear_screenshots all=false` / `hyprfast clear` / `hyprfast clear --all` (deletes /tmp/hyprfast-*.png tracked) |
+| Session status | `session_status` / `hyprfast session status` (shows tracked files + bytes) |
 | Block on compositor event | `wait_for event=window_open match=WhatsApp timeout_s=5` / `hyprfast wait window_open --match-str WhatsApp --timeout 5` |
 | Keybinds | `binds` / `hyprfast binds` |
 
@@ -117,6 +119,21 @@ hyprfast handles WhatsApp Web via keyboard chords through `keyboard action=key k
 ```
 
 This isolates Brave on its own workspace, gives it full `1200×675` logical area, removes tiling overlap, and disables the bookmark-bar omnibox trapping.
+
+## Screenshot Session — auto-tracked, clear after task success
+
+Every `screenshot` (CLI `hyprfast screenshot --window ...` or MCP `screenshot`) is **auto-appended** to `$XDG_RUNTIME_DIR/hyprfast-session.json` (fallback `/tmp`, `src/session.rs`). No manual list needed.
+
+- **After successful task, clear:** `hyprfast clear` (CLI) or `clear_screenshots` (MCP, `all=false`) deletes only tracked `/tmp/hyprfast-*.png` and truncates session to `[]`. Returns `{removed, bytes_freed, tracked_before}`.
+- **Full cleanup (stale leftovers):** `hyprfast clear --all` or `clear_screenshots all=true` also sweeps untracked `/tmp/hyprfast-*.png` (extra_removed).
+- **Inspect:** `hyprfast session status` or `session_status` → `{session_file, tracked, existing, total_bytes, files[]}`. Also `hyprfast session list`.
+- **Pattern:** Do task with zero or more screenshots → on success `clear_screenshots` → next task starts clean. On failure, keep shots for debugging then `clear --all`.
+
+Example:
+```json
+{"tool":"screenshot","window":"0x..."} → {"path":"/tmp/hyprfast-....png"}
+{"tool":"clear_screenshots","all":false} → {"removed":3,"bytes_freed":480000}
+```
 
 ## Safety
 

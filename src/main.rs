@@ -4,6 +4,7 @@ mod input;
 mod screenshot;
 mod events;
 mod daemon;
+mod session;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -28,6 +29,8 @@ enum Commands {
     Wait { event: String, #[arg(long, default_value="")] match_str: String, #[arg(long, default_value="5")] timeout: f64 },
     Binds,
     Daemon { #[arg(long)] stop: bool },
+    Clear { #[arg(long)] all: bool },
+    Session { action: String },
     Mcp,
 }
 
@@ -85,6 +88,7 @@ fn main() -> Result<()> {
             let (data, meta) = screenshot::capture(&window.unwrap_or_default(), &region.unwrap_or_default(), 0.0)?;
             let path = format!("/tmp/hyprfast-{}.png", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
             std::fs::write(&path, &data)?;
+            let _ = session::record(&path);
             println!("saved {} {:?}", path, meta);
         }
         Some(Commands::Wait { event, match_str, timeout }) => {
@@ -102,6 +106,19 @@ fn main() -> Result<()> {
                 println!("starting hyprfastd on {}", daemon::daemon_path().display());
                 let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
                 rt.block_on(daemon::run_daemon())?;
+            }
+        }
+        Some(Commands::Clear { all }) => {
+            let v = if all { session::clear_all()? } else { session::clear()? };
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::Session { action }) => {
+            match action.as_str() {
+                "status" => println!("{}", serde_json::to_string_pretty(&session::status())?),
+                "clear" => println!("{}", serde_json::to_string_pretty(&session::clear()?)?),
+                "clear_all" => println!("{}", serde_json::to_string_pretty(&session::clear_all()?)?),
+                "list" => println!("{}", serde_json::to_string_pretty(&serde_json::json!({"files": session::list()}))?),
+                _ => println!("{}", serde_json::to_string_pretty(&session::status())?),
             }
         }
         Some(Commands::Mcp) | None => { run_mcp()?; }
@@ -122,9 +139,11 @@ fn run_mcp() -> Result<()> {
         {"name":"click_ui","description":"Click by accessible name via DoAction (no pointer, no screenshot)","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"window":{"type":"string"},"mark":{"type":"integer"}}}},
         {"name":"pointer","description":"Mouse: move|click|drag|scroll at global logical coords","inputSchema":{"type":"object","properties":{"action":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"button":{"type":"string"},"to_x":{"type":"number"},"to_y":{"type":"number"},"scroll_dy":{"type":"number"},"scroll_dx":{"type":"number"}}}},
         {"name":"keyboard","description":"Keyboard: type (text) or key (combo like ctrl+t). window focuses first.","inputSchema":{"type":"object","properties":{"action":{"type":"string"},"text":{"type":"string"},"keys":{"type":"string"},"window":{"type":"string"}}}},
-        {"name":"screenshot","description":"Capture via grim: window, region, or monitor. Returns file path + meta.","inputSchema":{"type":"object","properties":{"window":{"type":"string"},"region":{"type":"string"},"scale":{"type":"number"}}}},
+        {"name":"screenshot","description":"Capture via grim: window, region, or monitor. Returns file path + meta. Auto-tracked for session clear.","inputSchema":{"type":"object","properties":{"window":{"type":"string"},"region":{"type":"string"},"scale":{"type":"number"}}}},
         {"name":"wait_for","description":"Block on Hyprland events: window_open/window_close/workspace/title_change/layer_open/layer_close","inputSchema":{"type":"object","properties":{"event":{"type":"string"},"match":{"type":"string"},"timeout_s":{"type":"number"}}}},
-        {"name":"binds","description":"List Hyprland keybinds","inputSchema":{"type":"object","properties":{}}}
+        {"name":"binds","description":"List Hyprland keybinds","inputSchema":{"type":"object","properties":{}}},
+        {"name":"clear_screenshots","description":"Clear tracked screenshots (/tmp/hyprfast-*.png) after successful task — deletes files recorded in session and resets list. Use all=true to also delete untracked leftovers.","inputSchema":{"type":"object","properties":{"all":{"type":"boolean"}}}},
+        {"name":"session_status","description":"Show screenshot session status (tracked files, bytes, session file path)","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in reader.lines() {
         let line = line?;
@@ -227,7 +246,16 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let (data, meta) = screenshot::capture(w, r, scale)?;
             let path = format!("/tmp/hyprfast-{}.png", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
             std::fs::write(&path, &data)?;
+            let _ = session::record(&path);
             Ok(serde_json::json!({"path": path, "meta": meta}))
+        },
+        "clear_screenshots" => {
+            let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+            let v = if all { session::clear_all()? } else { session::clear()? };
+            Ok(v)
+        },
+        "session_status" => {
+            Ok(session::status())
         },
         "wait_for" => {
             let e = args.get("event").and_then(|v| v.as_str()).unwrap_or("window_open");
