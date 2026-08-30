@@ -97,6 +97,27 @@ hyprfast handles WhatsApp Web via keyboard chords through `keyboard action=key k
 
 **Never do:** `ui name="Khushi"` or `click_ui name="hello"` inside Brave without `--force-renderer-accessibility` — it will return `exposes no accessibility tree; use screenshot` and loop. Use keyboard. Only use `ui`/`click_ui` for native GTK apps (e.g. `zenity`, file chooser) where zbus is `9-13ms` vs `~250ms` (`src/a11y/zbus_impl.rs:64`).
 
+## Window Placement — WhatsApp Fullscreen Rule (prevents stuck tiled overlay)
+
+**Problem:** If WhatsApp Web in Brave is tiled (split) not fullscreen, Brave’s omnibox/search overlay traps focus and `ctrl+alt+/` / typing gets stuck — screenshots show “Search Google |” overlay and no chat search.
+
+**Rule:** Before any WhatsApp keyboard flow, check `desktop` → `windows` where `class=="brave-browser"` and `title` contains `WhatsApp`:
+- If `fullscreen != true` and `size` != monitor `geometry` (i.e. tiled 581×629), **shift it to an unused workspace and fullscreen there**.
+
+**How to find unused:** `desktop.workspaces` where `windows==0` → pick first empty `id` (usually 3..10). If none, use `10`.
+
+**Flow:**
+```json
+{"tool":"desktop"} // inspect brave window at/size vs monitors geometry, check fullscreen
+// if not fullscreen:
+→ {"tool":"hypr","action":"move_window","target":"0x...brave...","workspace":"3"}
+→ {"tool":"hypr","action":"workspace","target":"3"}
+→ {"tool":"hypr","action":"fullscreen","target":"0x...brave..."}
+→ re-check desktop fullscreen==true then continue with keyboard flow
+```
+
+This isolates Brave on its own workspace, gives it full `1200×675` logical area, removes tiling overlap, and disables the bookmark-bar omnibox trapping.
+
 ## Safety
 
 - Confirm recipient/content before `Enter` to send — same as `close_window`.
