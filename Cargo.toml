@@ -1,8 +1,8 @@
 [package]
 name = "hyprfast"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
-description = "Fast hypruse alternative: persistent Hyprland IPC + direct AT-SPI, MCP + CLI"
+description = "Fast hypruse alternative: persistent Hyprland IPC + direct AT-SPI + CDP browser automation, MCP + CLI"
 license = "MIT"
 
 [[bin]]
@@ -29,3 +29,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.27", features = ["user"] }
 regex = "1"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json"], default-features = false }
+base64 = "0.22"
+url = "2"

@@ -1,13 +1,13 @@
 ---
 name: hyprfast
-description: Fast Rust alternative to hypruse — persistent Hyprland IPC + direct zbus AT-SPI, MCP+CLI. Use whenever you need desktop/window/workspace ops, AT-SPI clicks without screenshots, or WhatsApp Web/Brave automation. Consult for WhatsApp Web shortcuts and for hyprfast's desktop/hypr/launch/ui/click_ui/pointer/keyboard/screenshot/wait_for/binds tools.
+description: Fast Rust alternative to hypruse — persistent Hyprland IPC + direct zbus AT-SPI + CDP browser automation, MCP+CLI. Use whenever you need desktop/window/workspace ops, AT-SPI clicks, Brave/Chromium automation via Chrome DevTools, or WhatsApp Web. Consult for hyprfast's desktop/hypr/launch/ui/click_ui/pointer/keyboard/screenshot/wait_for/binds + browser_navigate/snapshot/click/type/evaluate/screenshot/tabs tools.
 ---
 
-# hyprfast — fast hypruse alternative
+# hyprfast — fast hypruse alternative (0.5 with CDP)
 
-`hyprfast` is `hypruse` without the forks: direct Unix socket to Hyprland (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, `j/<cmd>`), persistent `zbus` D-Bus to `org.a11y.Bus` (no `busctl` per node), `DoAction` clicks (no `movecursor`+`click`), optional `hyprfastd` daemon cache.
+`hyprfast` is `hypruse` without the forks: direct Unix socket to Hyprland (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, `j/<cmd>`), persistent `zbus` D-Bus to `org.a11y.Bus` (no `busctl` per node), `DoAction` clicks (no `movecursor`+`click`), optional `hyprfastd` daemon cache, **plus built-in CDP browser automation (no Node, no @browsermcp/mcp)** — one binary for Hyprland + AT-SPI + Chrome DevTools.
 
-Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds`) but `~10-150×` faster.
+Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds`) **plus** `browser_*` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, etc.) — full `browsermcp` parity via `src/cdp/mod.rs:30` + `src/browser/mod.rs:1`, but `~10-150×` faster and 0 extra deps.
 
 ## Quick reference (MCP + CLI)
 
@@ -25,12 +25,43 @@ Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `poi
 | Session status | `session_status` / `hyprfast session status` (shows tracked files + bytes) |
 | Block on compositor event | `wait_for event=window_open match=WhatsApp timeout_s=5` / `hyprfast wait window_open --match-str WhatsApp --timeout 5` |
 | Keybinds | `binds` / `hyprfast binds` |
+| Browser navigate | `browser_navigate url="https://example.com"` / `hyprfast browser navigate https://example.com` |
+| Browser snapshot (AX refs) | `browser_snapshot` / `hyprfast browser snapshot` — returns refs for click/type |
+| Browser click | `browser_click element="Submit" ref="12"` / `hyprfast browser click --selector "button.submit"` |
+| Browser type | `browser_type element="Search" ref="5" text="hello" submit=true` / `hyprfast browser type "hello" --selector "input"` |
+| Browser eval | `browser_evaluate js="document.title"` / `hyprfast browser eval "document.title"` |
+| Browser screenshot (CDP) | `browser_screenshot` / `hyprfast browser shot` — Page.captureScreenshot PNG, no grim |
+| Browser tabs | `browser_tabs` / `hyprfast browser tabs` — GET /json |
+| Launch Brave with CDP | `browser_open url="https://web.whatsapp.com"` / `hyprfast browser open https://web.whatsapp.com --workspace 3` |
 
 **Rules from hyprsuse still apply:**
 - `desktop` first, then act on `address`. Never screenshot to locate windows.
-- `ui` > `screenshot+zoom`. `Brave/Chromium` needs `--force-renderer-accessibility` at launch or tree is empty (`brave-browser exposes no accessibility tree; use screenshot` — `src/a11y/mod.rs:35`).
-- `wait_for` > `sleep`. `hyprfastd` at `/run/user/1000/hyprfastd.sock` accelerates `desktop`+`wait_for`.
+- `ui` > `screenshot+zoom`. `Brave/Chromium` needs `--force-renderer-accessibility` at launch or tree is empty (`brave-browser exposes no accessibility tree; use screenshot` — `src/a11y/mod.rs:35`). **With 0.5 CDP, prefer `browser_snapshot`/`browser_click` over `ui` for browsers — CDP AX works without the flag and without pointer.**
+- `wait_for` > `sleep`. `hyprfastd` at `/run/user/1000/hyprfastd.sock` accelerates `desktop`+`wait_for`. For browsers, `browser_wait` or CDP `Page.loadEventFired` via `browser_navigate`.
 - `click_ui` uses `org.a11y.atspi.Action.DoAction(0)` (`src/a11y/zbus_impl.rs:295`), fallback to pointer.
+- `launch` now auto-injects `--remote-debugging-port=9222` for `brave/chromium/chrome` if missing (`src/main.rs:60`). Override via `HYPRFAST_CDP_HOST/PORT`.
+
+## Browser Automation (CDP — new in 0.5)
+
+hyprfast 0.5 embeds Chrome DevTools Protocol — no `@browsermcp/mcp` or `playwright` needed. One binary, one MCP. Uses `reqwest` GET `/json` discovery (`src/cdp/mod.rs:30`) + `tokio-tungstenite` WS JSON-RPC (`src/cdp/mod.rs:103`).
+
+| Want to... | hyprfast 0.5 |
+|---|---|
+| Launch debuggable Brave | `hyprfast browser open https://example.com --workspace 3` or `hyprfast launch "brave --new-window https://example.com"` (auto adds `--remote-debugging-port=9222`) |
+| List tabs | `browser_tabs` / `hyprfast browser tabs` |
+| Navigate | `browser_navigate url="https://news.ycombinator.com"` |
+| Snapshot refs | `browser_snapshot` → `{snapshot:[{role,name,ref,nodeId}]}` via `Accessibility.getFullAXTree` fallback JS |
+| Click | `browser_click element="Hacker News" ref="42"` — resolves `backendNodeId` via `DOM.resolveNode` then `Runtime.callFunctionOn` click |
+| Type | `browser_type element="Search" ref="5" text="hyprland" submit=true` |
+| Press key | `browser_press_key key="Enter"` via `Input.dispatchKeyEvent` |
+| Evaluate JS | `browser_evaluate js="document.title"` via `Runtime.evaluate` |
+| Screenshot (browser) | `browser_screenshot` via `Page.captureScreenshot` PNG (no grim, per-tab) |
+
+Flow: `desktop` → `hypr focus_window` or `browser_open` → `browser_snapshot` → `browser_click/type` → `browser_screenshot` verify. Prefer CDP for browsers; keep `ui/click_ui` for native GTK apps.
+
+**Env:** `HYPRFAST_CDP_HOST`/`PORT` default `127.0.0.1:9222`. Error `CDP unreachable...` means browser not launched with flag — use `hyprfast browser open ...`.
+
+**Migration:** Replace `npx @browsermcp/mcp` with `hyprfast mcp` — already includes `browser_*` tools parity (14 tools). Disable `browsermcp` in `opencode.json` after 0.5.
 
 ## Brave/Chromium gotchas
 
