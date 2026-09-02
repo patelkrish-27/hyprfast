@@ -27,6 +27,9 @@ pub mod file_upload;
 
 use anyhow::Result;
 use serde_json::{Value, json};
+fn dirs_fallback() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") { std::path::PathBuf::from(home).join(".config/hyprfast/stagehand.env") } else { std::path::PathBuf::from("/tmp/stagehand.env") }
+}
 
 pub use act::act;
 pub use observe::observe;
@@ -46,9 +49,17 @@ pub struct StagehandConfig {
 
 impl StagehandConfig {
     pub fn from_env() -> Self {
-        let model = std::env::var("STAGEHAND_MODEL").unwrap_or_else(|_| "openai/gpt-4o-mini".into());
+        // Load optional local env file ~/.config/hyprfast/stagehand.env (not committed) — allows Gemini key without shell export
+        let _ = Self::load_dotenv();
+        let model_default = if std::env::var("GOOGLE_API_KEY").is_ok() || std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_GENERATIVE_AI_API_KEY").is_ok() {
+            "google/gemini-2.5-flash"
+        } else { "openai/gpt-4o-mini" };
+        let model = std::env::var("STAGEHAND_MODEL").unwrap_or_else(|_| model_default.into());
         let key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+            .or_else(|_| std::env::var("GEMINI_API_KEY"))
+            .or_else(|_| std::env::var("GOOGLE_GENERATIVE_AI_API_KEY"))
             .unwrap_or_default();
         Self {
             model_name: model,
@@ -58,6 +69,23 @@ impl StagehandConfig {
             self_heal: true,
             system_prompt: std::env::var("STAGEHAND_SYSTEM_PROMPT").ok(),
         }
+    }
+    fn load_dotenv() -> Result<(), ()> {
+        for path in [dirs_fallback(), std::path::PathBuf::from("/tmp/stagehand.env")] {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') { continue; }
+                        if let Some((k,v)) = line.split_once('=') {
+                            let k = k.trim(); let v = v.trim().trim_matches('"').trim_matches('\'');
+                            if std::env::var(k).is_err() { std::env::set_var(k, v); }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
     pub fn with_model(mut self, model: &str, api_key: &str) -> Self {
         self.model_name = model.to_string();

@@ -1,1 +1,6 @@
 /target
+# local LLM creds — never commit
+.env
+*.env
+stagehand.env
+.config/hyprfast/stagehand.env
