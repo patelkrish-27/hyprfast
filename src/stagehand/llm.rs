@@ -59,7 +59,7 @@ pub fn generate(messages: Vec<ChatMessage>, cfg: &LlmConfig, json_mode: bool) ->
 }
 
 async fn async_generate(messages: Vec<ChatMessage>, provider: &str, model: &str, base: &str, cfg: &LlmConfig, json_mode: bool) -> Result<Value> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(45)).build()?;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(45)).no_proxy().build()?;
     match provider {
         "anthropic" => anthropic_generate(&client, base, model, cfg, messages, json_mode).await,
         "google" => google_generate(&client, base, model, cfg, messages, json_mode).await,
@@ -145,7 +145,11 @@ async fn google_generate(client: &reqwest::Client, base: &str, model: &str, cfg:
     let text = v.get("candidates").and_then(|c| c.get(0))
         .and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.get(0))
         .and_then(|p| p.get("text")).and_then(|t| t.as_str()).unwrap_or("");
-    if let Ok(j) = serde_json::from_str::<Value>(text) { Ok(j) } else { Ok(json!({"content": text})) }
+    if let Ok(j) = serde_json::from_str::<Value>(text) { return Ok(j); }
+    if let Some(s) = text.find('{').and_then(|st| text.rfind('}').map(|en| &text[st..=en])) {
+        if let Ok(j) = serde_json::from_str::<Value>(s) { return Ok(j); }
+    }
+    Ok(json!({"content": text}))
 }
 
 // Runtime helper — reuse hyprfast cdp rt trick without circular dep
