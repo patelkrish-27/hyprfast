@@ -1,13 +1,13 @@
 ---
 name: hyprfast
-description: Fast Rust alternative to hypruse — persistent Hyprland IPC + direct zbus AT-SPI + CDP browser automation, MCP+CLI. Use whenever you need desktop/window/workspace ops, AT-SPI clicks, Brave/Chromium automation via Chrome DevTools, or WhatsApp Web. Consult for hyprfast's desktop/hypr/launch/ui/click_ui/pointer/keyboard/screenshot/wait_for/binds + browser_navigate/snapshot/click/type/evaluate/screenshot/tabs tools.
+description: Fast Rust alternative to hypruse — persistent Hyprland IPC + direct zbus AT-SPI + CDP browser + Stagehand LLM runtime, MCP+CLI. Use whenever you need desktop/window/workspace ops, AT-SPI clicks, Brave/Chromium via Chrome DevTools, WhatsApp Web, or LLM-driven act/observe/extract/agent. Consult for hyprfast's desktop/hypr/launch/ui/click_ui/pointer/keyboard/screenshot/wait_for/binds + browser_navigate/snapshot/click/type/evaluate/screenshot/tabs + stagehand_act/observe/extract/agent tools.
 ---
 
-# hyprfast — fast hypruse alternative (0.5 with CDP)
+# hyprfast — fast hypruse alternative (0.6 with Stagehand)
 
-`hyprfast` is `hypruse` without the forks: direct Unix socket to Hyprland (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, `j/<cmd>`), persistent `zbus` D-Bus to `org.a11y.Bus` (no `busctl` per node), `DoAction` clicks (no `movecursor`+`click`), optional `hyprfastd` daemon cache, **plus built-in CDP browser automation (no Node, no @browsermcp/mcp)** — one binary for Hyprland + AT-SPI + Chrome DevTools.
+`hyprfast` is `hypruse` without the forks: direct Unix socket to Hyprland (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, `j/<cmd>`), persistent `zbus` D-Bus to `org.a11y.Bus` (no `busctl` per node), `DoAction` clicks (no `movecursor`+`click`), optional `hyprfastd` daemon cache, **plus built-in CDP browser automation (no Node, no @browsermcp/mcp)** + **Stagehand LLM runtime (no JS, port of browserbase/stagehand act/observe/extract/agent)** — one binary for Hyprland + AT-SPI + Chrome DevTools + LLM.
 
-Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds`) **plus** `browser_*` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, etc.) — full `browsermcp` parity via `src/cdp/mod.rs:30` + `src/browser/mod.rs:1`, but `~10-150×` faster and 0 extra deps.
+Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds`) **plus** `browser_*` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, etc.) — full `browsermcp` parity via `src/cdp/mod.rs:30` + `src/browser/mod.rs:1` **plus** `stagehand_*` (`stagehand_act`, `stagehand_observe`, `stagehand_extract`, `stagehand_agent`, `stagehand_snapshot`, `stagehand_cache`, `stagehand_metrics`, `stagehand_batch`, `stagehand_webmcp`) — full `stagehand` parity via `src/stagehand/*`, but `~10-150×` faster and 0 extra deps.
 
 ## Quick reference (MCP + CLI)
 
@@ -33,6 +33,11 @@ Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `poi
 | Browser screenshot (CDP) | `browser_screenshot` / `hyprfast browser shot` — Page.captureScreenshot PNG, no grim |
 | Browser tabs | `browser_tabs` / `hyprfast browser tabs` — GET /json |
 | Launch Brave with CDP | `browser_open url="https://web.whatsapp.com"` / `hyprfast browser open https://web.whatsapp.com --workspace 3` |
+| Stagehand act | `stagehand_act instruction="click login"` / `hyprfast stagehand act "click login"` — hybrid AX + LLM → CDP |
+| Stagehand observe | `stagehand_observe instruction="find submit buttons"` / `hyprfast stagehand observe --instruction "find submit"` — returns elementId+method |
+| Stagehand extract | `stagehand_extract instruction="extract price" schema="{\"price\":\"string\"}"` / `hyprfast stagehand extract "extract price"` — JSON |
+| Stagehand agent | `stagehand_agent goal="search cats" max_steps=6` / `hyprfast stagehand agent "search cats" --max-steps 6` — autonomous loop |
+| Stagehand metrics/cache | `stagehand_metrics` / `stagehand_cache action=status` |
 
 **Rules from hyprsuse still apply:**
 - `desktop` first, then act on `address`. Never screenshot to locate windows.
@@ -40,6 +45,10 @@ Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `poi
 - `wait_for` > `sleep`. `hyprfastd` at `/run/user/1000/hyprfastd.sock` accelerates `desktop`+`wait_for`. For browsers, `browser_wait` or CDP `Page.loadEventFired` via `browser_navigate`.
 - `click_ui` uses `org.a11y.atspi.Action.DoAction(0)` (`src/a11y/zbus_impl.rs:295`), fallback to pointer.
 - `launch` now auto-injects `--remote-debugging-port=9222` for `brave/chromium/chrome` if missing (`src/main.rs:60`). Override via `HYPRFAST_CDP_HOST/PORT`.
+
+## Stagehand Runtime (LLM — new in 0.6)
+
+Full `browserbase/stagehand` port in Rust: `protocol` → `src/stagehand/protocol.rs:1`, `prompt.ts` → `prompt.rs`, `a11y/snapshot` hybrid → `a11y/*` + `snapshot.rs`, `act/observe/extract/agent` → `act.rs/observe.rs/extract.rs/agent.rs` (self-heal, twoStep dropdown, chunking, JSON-schema), `batch/webmcp/cookies/clipboard/fileUpload` → respective modules, `metrics` → `instrumentation.rs`. Set `OPENAI_API_KEY` + `STAGEHAND_MODEL=openai/gpt-4o-mini` (also `anthropic/*`, `google/*`), then `hyprfast stagehand snapshot` (no LLM) to test CDP, else `stagehand_act` via MCP.
 
 ## Browser Automation (CDP — new in 0.5)
 

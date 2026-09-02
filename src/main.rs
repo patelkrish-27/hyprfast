@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 mod hypr;
 mod a11y;
 mod input;
@@ -7,6 +8,7 @@ mod daemon;
 mod session;
 mod cdp;
 mod browser;
+mod stagehand;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -55,6 +57,28 @@ enum BrowserCmd {
 }
 
 #[derive(Subcommand)]
+enum StagehandCmd {
+    /// LLM-driven action: "click the login button"
+    Act { instruction: String, #[arg(long)] model: Option<String>, #[arg(long)] cache: Option<bool> },
+    /// Discover actionable elements
+    Observe { instruction: Option<String>, #[arg(long)] model: Option<String> },
+    /// Extract structured data: instruction + optional JSON schema string
+    Extract { instruction: String, #[arg(long)] schema: Option<String>, #[arg(long)] model: Option<String> },
+    /// Autonomous agent loop
+    Agent { goal: String, #[arg(long, default_value="6")] max_steps: usize, #[arg(long)] model: Option<String> },
+    /// Hybrid snapshot (stagehand tree)
+    Snapshot,
+    /// Cache ops
+    Cache { action: String },
+    /// Metrics (act/observe/extract tokens)
+    Metrics,
+    /// Batch (experimentalBatch callbackSource)
+    Batch { callback_source: String, #[arg(long)] input: Option<String>, #[arg(long, default_value="30000")] timeout: u32 },
+    /// WebMCP list/invoke
+    Webmcp { action: String, #[arg(long)] tool: Option<String>, #[arg(long)] input: Option<String> },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     Desktop,
     Hypr { action: String, #[arg(default_value="")] target: String, #[arg(default_value="")] workspace: String },
@@ -70,6 +94,7 @@ enum Commands {
     Clear { #[arg(long)] all: bool },
     Session { action: String },
     Browser { #[command(subcommand)] cmd: BrowserCmd },
+    Stagehand { #[command(subcommand)] cmd: StagehandCmd },
     Mcp,
 }
 
@@ -241,9 +266,62 @@ fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
+        Some(Commands::Stagehand { cmd }) => {
+            let cfg = stagehand_cfg_from_args(&cmd);
+            let res = match cmd {
+                StagehandCmd::Act { instruction, .. } => stagehand::act::act(&instruction, &cfg)?,
+                StagehandCmd::Observe { instruction, .. } => stagehand::observe::observe(instruction.as_deref(), &cfg)?,
+                StagehandCmd::Extract { instruction, schema, .. } => {
+                    let sch = schema.as_deref().and_then(|s| serde_json::from_str(s).ok());
+                    stagehand::extract::extract(&instruction, sch.as_ref(), &cfg)?
+                },
+                StagehandCmd::Agent { goal, max_steps, .. } => stagehand::agent::execute(&goal, &cfg, max_steps)?,
+                StagehandCmd::Snapshot => {
+                    let snap = stagehand::snapshot::capture_hybrid()?;
+                    serde_json::json!({"combined_tree": snap.combined_tree, "xpath_map": snap.combined_xpath_map, "via": snap.via, "raw_nodes": snap.raw_ax_nodes})
+                },
+                StagehandCmd::Cache { action } => match action.as_str() {
+                    "clear" => stagehand::cache::clear_cache()?,
+                    "status" => stagehand::cache::cache_status(),
+                    _ => stagehand::cache::cache_status(),
+                },
+                StagehandCmd::Metrics => stagehand::instrumentation::METRICS.snapshot(),
+                StagehandCmd::Batch { callback_source, input, timeout } => {
+                    let v = input.as_deref().and_then(|s| serde_json::from_str(s).ok());
+                    stagehand::batch::experimental_batch(&callback_source, v, timeout)?
+                },
+                StagehandCmd::Webmcp { action, tool, input } => match action.as_str() {
+                    "list" => serde_json::json!({"tools": stagehand::webmcp::list_tools("")?}),
+                    "invoke" => {
+                        let t = tool.clone().unwrap_or_default();
+                        let iv: serde_json::Value = input.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(serde_json::json!({}));
+                        stagehand::webmcp::invoke_tool("", &t, iv)?
+                    },
+                    _ => serde_json::json!({"error": "webmcp action must be list|invoke"}),
+                },
+            };
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
         Some(Commands::Mcp) | None => { run_mcp()?; }
     }
     Ok(())
+}
+
+fn stagehand_cfg_from_args(cmd: &StagehandCmd) -> stagehand::StagehandConfig {
+    let mut cfg = stagehand::StagehandConfig::from_env();
+    let model_override = match cmd {
+        StagehandCmd::Act { model, .. } => model.as_deref(),
+        StagehandCmd::Observe { model, .. } => model.as_deref(),
+        StagehandCmd::Extract { model, .. } => model.as_deref(),
+        StagehandCmd::Agent { model, .. } => model.as_deref(),
+        _ => None,
+    };
+    if let Some(m) = model_override { cfg.model_name = m.to_string(); }
+    // allow OPENAI_API_KEY override via env already; also check STAGEHAND_API_KEY
+    if cfg.api_key.is_empty() {
+        cfg.api_key = std::env::var("STAGEHAND_API_KEY").unwrap_or_default();
+    }
+    cfg
 }
 
 fn run_mcp() -> Result<()> {
@@ -279,7 +357,22 @@ fn run_mcp() -> Result<()> {
         {"name":"browser_console","description":"CDP: get console logs (Console.enable)","inputSchema":{"type":"object","properties":{}}},
         {"name":"browser_go_back","description":"CDP: go back (history.back)","inputSchema":{"type":"object","properties":{}}},
         {"name":"browser_go_forward","description":"CDP: go forward (history.forward)","inputSchema":{"type":"object","properties":{}}},
-        {"name":"browser_open","description":"Hypr+CDP: launch Brave with --remote-debugging-port=9222 on workspace and navigate","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"workspace":{"type":"string"}},"required":["url"]}}
+        {"name":"browser_open","description":"Hypr+CDP: launch Brave with --remote-debugging-port=9222 on workspace and navigate","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"workspace":{"type":"string"}},"required":["url"]}},
+        // Stagehand port (Rust) — LLM-driven primitives from browserbase/stagehand
+        {"name":"stagehand_act","description":"Stagehand act: natural language browser action (LLM → CDP). instruction like 'click login' . Uses hybrid AX tree + LLM + self-heal. Requires OPENAI_API_KEY / STAGEHAND_MODEL env","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"Natural language action, e.g. 'click the login button'"},"model":{"type":"string","description":"optional model override like openai/gpt-4o-mini"},"useCache":{"type":"boolean"}},"required":["instruction"]}},
+        {"name":"stagehand_observe","description":"Stagehand observe: discover actionable elements matching instruction. Returns [{elementId, description, method, arguments, xpath}]","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"e.g. 'find all submit buttons' (optional, defaults to all)"},"model":{"type":"string"}},"required":[]}},
+        {"name":"stagehand_extract","description":"Stagehand extract: LLM extracts structured data from page. instruction + optional JSON schema (as string). Returns {data}","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"e.g. 'extract title and price'"},"schema":{"type":"string","description":"Optional JSON schema string (zod-like), e.g. '{\"title\":\"string\",\"price\":\"number\"}'"},"model":{"type":"string"}},"required":["instruction"]}},
+        {"name":"stagehand_agent","description":"Stagehand agent: autonomous loop act/extract until goal complete. goal + max_steps","inputSchema":{"type":"object","properties":{"goal":{"type":"string","description":"Natural language goal e.g. 'book a flight'"},"max_steps":{"type":"integer","default":8},"model":{"type":"string"}},"required":["goal"]}},
+        {"name":"stagehand_snapshot","description":"Stagehand hybrid snapshot: Accessibility.getFullAXTree + xpathMap + trimmed tree (same as Stagehand captureHybridSnapshot)","inputSchema":{"type":"object","properties":{}}},
+        {"name":"stagehand_cache","description":"Stagehand cache: status/clear for act cache at ~/.cache/hyprfast/stagehand-cache.json","inputSchema":{"type":"object","properties":{"action":{"type":"string","description":"status|clear"}},"required":[]}},
+        {"name":"stagehand_metrics","description":"Stagehand metrics: aggregate token usage for act/observe/extract","inputSchema":{"type":"object","properties":{}}},
+        {"name":"stagehand_batch","description":"Stagehand experimentalBatch: run serialized callbackSource in browser context","inputSchema":{"type":"object","properties":{"callbackSource":{"type":"string"},"input":{"type":"object"},"timeout":{"type":"integer"}},"required":["callbackSource"]}},
+        {"name":"stagehand_webmcp","description":"Stagehand WebMCP: list_tools/invoke_tool via page __webmcp","inputSchema":{"type":"object","properties":{"action":{"type":"string","description":"list|invoke"},"tool":{"type":"string"},"input":{"type":"object"}},"required":["action"]}},
+        {"name":"context_pages","description":"Stagehand context.pages: list pages via CDP Target.getTargets","inputSchema":{"type":"object","properties":{}}},
+        {"name":"context_cookies","description":"Stagehand context.cookies: get cookies","inputSchema":{"type":"object","properties":{}}},
+        {"name":"cookies_set","description":"Set cookies via Storage.setCookies","inputSchema":{"type":"object","properties":{"cookies":{"type":"array"}}}},
+        {"name":"clipboard_write","description":"Clipboard write via CDP","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+        {"name":"clipboard_read","description":"Clipboard read via CDP","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in reader.lines() {
         let line = line?;
@@ -481,6 +574,77 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             std::thread::sleep(std::time::Duration::from_millis(800));
             Ok(serde_json::json!({"launched": url}))
         },
+        // ----- Stagehand port -----
+        "stagehand_act" => {
+            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+            if instruction.is_empty() { anyhow::bail!("stagehand_act needs instruction"); }
+            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let mut cfg = stagehand::StagehandConfig::from_env();
+            if !model.is_empty() { cfg.model_name = model.to_string(); }
+            stagehand::act::act(instruction, &cfg)
+        },
+        "stagehand_observe" => {
+            let instruction = args.get("instruction").and_then(|v| v.as_str());
+            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let mut cfg = stagehand::StagehandConfig::from_env();
+            if !model.is_empty() { cfg.model_name = model.to_string(); }
+            stagehand::observe::observe(instruction, &cfg)
+        },
+        "stagehand_extract" => {
+            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+            let schema_str = args.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let mut cfg = stagehand::StagehandConfig::from_env();
+            if !model.is_empty() { cfg.model_name = model.to_string(); }
+            let schema: Option<Value> = if schema_str.is_empty() { None } else { serde_json::from_str(schema_str).ok() };
+            stagehand::extract::extract(instruction, schema.as_ref(), &cfg)
+        },
+        "stagehand_agent" => {
+            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+            if goal.is_empty() { anyhow::bail!("stagehand_agent needs goal"); }
+            let max_steps = args.get("max_steps").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let mut cfg = stagehand::StagehandConfig::from_env();
+            if !model.is_empty() { cfg.model_name = model.to_string(); }
+            stagehand::agent::execute(goal, &cfg, max_steps)
+        },
+        "stagehand_snapshot" => {
+            let snap = stagehand::snapshot::capture_hybrid()?;
+            Ok(serde_json::json!({"combined_tree": snap.combined_tree, "xpath_map": snap.combined_xpath_map, "via": snap.via, "raw_nodes": snap.raw_ax_nodes}))
+        },
+        "stagehand_cache" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+            match action {
+                "clear" => stagehand::cache::clear_cache(),
+                _ => Ok(stagehand::cache::cache_status()),
+            }
+        },
+        "stagehand_metrics" => Ok(stagehand::instrumentation::METRICS.snapshot()),
+        "stagehand_batch" => {
+            let src = args.get("callbackSource").or_else(|| args.get("callback_source")).and_then(|v| v.as_str()).unwrap_or("");
+            let input = args.get("input").cloned();
+            let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000) as u32;
+            stagehand::batch::experimental_batch(src, input, timeout)
+        },
+        "stagehand_webmcp" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            match action {
+                "invoke" => {
+                    let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+                    stagehand::webmcp::invoke_tool("", tool, input)
+                },
+                _ => Ok(serde_json::json!({"tools": stagehand::webmcp::list_tools("")?})),
+            }
+        },
+        "context_pages" => stagehand::context::pages(),
+        "context_cookies" => Ok(serde_json::json!({"cookies": stagehand::cookies::get_cookies()?})),
+        "cookies_set" => {
+            let cs = args.get("cookies").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            stagehand::cookies::set_cookies(cs)?; Ok(serde_json::json!({"ok": true}))
+        },
+        "clipboard_write" => { let t = args.get("text").and_then(|v| v.as_str()).unwrap_or(""); stagehand::clipboard::write_text(t)?; Ok(serde_json::json!({"ok": true})) },
+        "clipboard_read" => Ok(serde_json::json!({"text": stagehand::clipboard::read_text()?})),
         _ => anyhow::bail!("unknown tool {}", name),
     }
 }
