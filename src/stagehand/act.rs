@@ -18,6 +18,49 @@ fn current_url() -> String {
         .unwrap_or_default()
 }
 
+fn find_name_for_id(tree: &str, id: &str) -> Option<String> {
+    if id.is_empty() { return None; }
+    for line in tree.lines() {
+        if line.contains(id) {
+            // line like `[0-4231] button 'New chat' 4231` — extract between single quotes
+            if let Some(s) = line.find('\'') {
+                if let Some(e) = line[s+1..].find('\'') {
+                    let name = line[s+1..s+1+e].trim().to_string();
+                    if !name.is_empty() { return Some(name); }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_target_from_instruction(instr: &str) -> String {
+    // prefer quoted text e.g. 'New chat' or "New chat"
+    if let Some(a) = instr.find('\'') {
+        if let Some(b) = instr[a+1..].find('\'') {
+            let s = instr[a+1..a+1+b].trim();
+            if !s.is_empty() { return s.to_string(); }
+        }
+    }
+    if let Some(a) = instr.find('"') {
+        if let Some(b) = instr[a+1..].find('"') {
+            let s = instr[a+1..a+1+b].trim();
+            if !s.is_empty() { return s.to_string(); }
+        }
+    }
+    // fallback: last meaningful words before button/link
+    let lower = instr.to_lowercase();
+    for kw in ["button", "link", "prompt box", "input"] {
+        if let Some(pos) = lower.find(kw) {
+            let before = instr[..pos].trim();
+            if let Some(last) = before.split('\'').last().map(|s| s.trim()) {
+                if !last.is_empty() && last.len() < 40 { return last.to_string(); }
+            }
+        }
+    }
+    instr.split_whitespace().take(5).collect::<Vec<_>>().join(" ")
+}
+
 /// Take deterministic action from LLM output — mirrors performUnderstudyMethod()
 pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value> {
     let method = action.get("method").and_then(|v| v.as_str()).unwrap_or("click");
@@ -179,14 +222,45 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
         }
         // Try to parse flat
         if llm_resp.get("elementId").is_some() {
-            let res = execute_action(&llm_resp, None)?;
+            let mut res = execute_action(&llm_resp, None);
+            if res.is_err() {
+                let err_str = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+                if err_str.contains("Could not find object") || err_str.contains("not found") {
+                    let elem_id = llm_resp.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = find_name_for_id(&snap.combined_tree, elem_id).unwrap_or_else(|| extract_target_from_instruction(instruction));
+                    if !name.is_empty() {
+                        let js = format!("(() => {{ const els=[...document.querySelectorAll('button, [role=\"button\"], a, div, span')]; const t=els.find(e=>e.textContent.trim().toLowerCase().includes({:?}.toLowerCase())); if(t){{t.click(); return 'fallback clicked';}} return 'fallback not found'; }})()", name.to_lowercase());
+                        if let Ok(v) = cdp::evaluate(&js, false) {
+                            if v.to_string().contains("fallback clicked") { res = Ok(v); }
+                        }
+                    }
+                }
+            }
+            let res = res?;
             return Ok(json!({"success": true, "actionDescription": instruction, "actions": [llm_resp], "result": res, "xpathMap": snap.combined_xpath_map}));
         }
         return Ok(json!({"success": false, "message": format!("LLM did not return actionable element: {}", llm_resp), "actions": [], "llm": llm_resp}));
     }
 
-    // Execute with self-heal retry (Stagehand actService selfHeal)
+    // Execute with self-heal retry (Stagehand actService selfHeal) + eval fallback for stale backend (cause #6)
     let mut result = execute_action(&action_obj, None);
+    // Fallback to JS text search if backend resolve failed (common for Gemini New chat etc. 0-4231)
+    if result.is_err() {
+        let err_str = result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+        if err_str.contains("Could not find object") || err_str.contains("backend") || err_str.contains("not found") {
+            // Try to find element name from snapshot for this elementId
+            let elem_id = action_obj.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
+            let name = find_name_for_id(&snap.combined_tree, elem_id).unwrap_or_else(|| extract_target_from_instruction(instruction));
+            if !name.is_empty() {
+                let js = format!("(() => {{ const els=[...document.querySelectorAll('button, [role=\"button\"], a, div, span')]; const t=els.find(e=>e.textContent.trim().toLowerCase().includes({:?}.toLowerCase())); if(t){{t.click(); return 'fallback clicked '+t.tagName+': '+t.textContent.slice(0,30);}} return 'fallback not found for '+{:?}; }})()", name.to_lowercase(), name);
+                if let Ok(v) = cdp::evaluate(&js, false) {
+                    if v.as_str().map(|s| s.contains("fallback clicked")).unwrap_or(false) || v.to_string().contains("fallback clicked") {
+                        result = Ok(v);
+                    }
+                }
+            }
+        }
+    }
     if cfg.self_heal && result.is_err() {
         eprintln!("[stagehand act] self-heal: retry after re-snapshot");
         if let Ok(snap2) = snapshot::capture_hybrid() {
