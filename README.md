@@ -2,7 +2,7 @@
 
 **hypruse is slow because it forks.** `hyprfast` fixes that.
 
-| hypruse 0.9.4 (Python) | hyprfast 0.6.0 (Rust) | speedup |
+| hypruse 0.9.4 (Python) | hyprfast 0.6.1 (Rust) | speedup |
 |---|---|---|
 | `hyprctl` fork per query (5 queries = 5 forks + Python startup) | Direct Unix socket to `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock` , no fork | **~10-150×** (3ms vs 471ms cold, 33ms warm) |
 | `busctl` fork per AT-SPI node (400 nodes → ~1200 forks, ~800ms) | Persistent `zbus` D-Bus connection, pipelined calls (target <50ms) | **~16×** |
@@ -22,7 +22,7 @@ hyprfast desktop      3ms
 ## Architecture
 
 ```
-Agent --(MCP stdio)--> hyprfast 0.6 --(Unix socket)--> Hyprland
+Agent --(MCP stdio)--> hyprfast 0.6.1 --(Unix socket)--> Hyprland
                             |
                             +--(zbus D-Bus)--> AT-SPI a11y bus (no busctl)
                             +--(grim)--------> screenshot only as fallback
@@ -30,7 +30,8 @@ Agent --(MCP stdio)--> hyprfast 0.6 --(Unix socket)--> Hyprland
                             +--(HTTP+WS :9222)-> Brave/Chromium CDP (no Node)
                                 |-- Page/DOM/Accessibility/Runtime/Network/Input
                                 +-- Stagehand hybrid AX (src/stagehand/snapshot + a11y/*) + LLM (openai/anthropic/google) → act/observe/extract/agent
-                            +--(Stagehand runtime) 41 MCP tools incl. stagehand_*
+                            +--(Stagehand runtime) 47 MCP tools incl. stagehand_* + task_*
+                            +--(Task State) src/task.rs persistent todo $XDG_RUNTIME_DIR/hyprfast-tasks.json
 ```
 
 **Key design choices:**
@@ -93,7 +94,7 @@ hyprfast mcp
 }
 ```
 
-Tools exposed (41): `desktop`, `hypr`, `launch` (auto `--remote-debugging-port` for browsers), `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds` + **CDP browser** `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_hover`, `browser_type`, `browser_select_option`, `browser_press_key`, `browser_wait`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, `browser_console`, `browser_go_back/forward`, `browser_open` — full `@browsermcp/mcp` parity without Node + **Stagehand** `stagehand_act`, `stagehand_observe`, `stagehand_extract`, `stagehand_agent`, `stagehand_snapshot`, `stagehand_cache`, `stagehand_metrics`, `stagehand_batch`, `stagehand_webmcp` + `context_pages`, `context_cookies`, `clipboard_*` — full `browserbase/stagehand` port without Node.
+Tools exposed (47): `desktop`, `hypr`, `launch` (auto `--remote-debugging-port` for browsers), `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds` + **CDP browser** `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_hover`, `browser_type`, `browser_select_option`, `browser_press_key`, `browser_wait`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, `browser_console`, `browser_go_back/forward`, `browser_open` — full `@browsermcp/mcp` parity without Node + **Stagehand** `stagehand_act`, `stagehand_observe`, `stagehand_extract`, `stagehand_agent`, `stagehand_snapshot`, `stagehand_cache`, `stagehand_metrics`, `stagehand_batch`, `stagehand_webmcp` + `context_pages`, `context_cookies`, `clipboard_*` — full `browserbase/stagehand` port without Node + **Task State** `task_init/status/update/add/clear/next` (`src/task.rs:1`).
 
 Env: `HYPRFAST_CDP_HOST=127.0.0.1` `HYPRFAST_CDP_PORT=9222` `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`STAGEHAND_MODEL` (e.g. `openai/gpt-4o-mini`, `anthropic/claude-3.5-sonnet`) `STAGEHAND_BASE_URL` `STAGEHAND_SYSTEM_PROMPT`.
 
@@ -111,6 +112,7 @@ See `src/stagehand/mod.rs:1` for module map; skipped `sdk-go`/`sdk-python`/`exam
 - [x] v0.4: local grim JPEG + session tracking (done)
 - [x] v0.5: CDP browser automation — pure Rust, no `@browsermcp/mcp`/playwright needed (`src/cdp/mod.rs:30`, `src/browser/mod.rs:1`)
 - [x] v0.6: Stagehand runtime — full port of `browserbase/stagehand` `act`/`observe`/`extract`/`agent` hybrid AX + LLM (self-heal, cache, batch, WebMCP) into Rust (`src/stagehand/*`), 41 MCP tools (`Cargo.toml:3` `0.6.0`)
+- [x] v0.6.1: Task State — persistent todo `$XDG_RUNTIME_DIR/hyprfast-tasks.json` for multi-step resume (`task_init/status/update/next/add/clear`, `src/task.rs:1`), 47 MCP tools (`Cargo.toml:3` `0.6.1`)
 
 ## Why not just optimize hypruse?
 

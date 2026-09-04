@@ -6,6 +6,7 @@ mod screenshot;
 mod events;
 mod daemon;
 mod session;
+mod task;
 mod cdp;
 mod browser;
 mod stagehand;
@@ -79,6 +80,24 @@ enum StagehandCmd {
 }
 
 #[derive(Subcommand)]
+enum TaskCmd {
+    /// Initialize task list: breakdown goal into steps
+    Init { goal: String, #[arg(long)] steps: String },
+    /// Add a step to current task list
+    Add { description: String },
+    /// Update step status: pending|in_progress|completed|failed|skipped
+    Update { #[arg(long)] index: Option<usize>, #[arg(long)] id: Option<usize>, status: String },
+    /// Show current task status & progress
+    Status,
+    /// Clear all tasks (manual)
+    Clear,
+    /// Get next pending step
+    Next,
+    /// List - alias for Status
+    List,
+}
+
+#[derive(Subcommand)]
 enum Commands {
     Desktop,
     Hypr { action: String, #[arg(default_value="")] target: String, #[arg(default_value="")] workspace: String },
@@ -93,6 +112,7 @@ enum Commands {
     Daemon { #[arg(long)] stop: bool },
     Clear { #[arg(long)] all: bool },
     Session { action: String },
+    Task { #[command(subcommand)] cmd: TaskCmd },
     Browser { #[command(subcommand)] cmd: BrowserCmd },
     Stagehand { #[command(subcommand)] cmd: StagehandCmd },
     Mcp,
@@ -204,6 +224,21 @@ fn main() -> Result<()> {
                 "list" => println!("{}", serde_json::to_string_pretty(&serde_json::json!({"files": session::list()}))?),
                 _ => println!("{}", serde_json::to_string_pretty(&session::status())?),
             }
+        }
+        Some(Commands::Task { cmd }) => {
+            let res = match cmd {
+                TaskCmd::Init { goal, steps } => {
+                    let parsed = task::parse_steps_arg(&steps);
+                    task::init(&goal, parsed)?
+                },
+                TaskCmd::Add { description } => task::add(&description)?,
+                TaskCmd::Update { index, id, status } => task::update(index, id, &status)?,
+                TaskCmd::Status => task::status(),
+                TaskCmd::Clear => task::clear()?,
+                TaskCmd::Next => task::next_pending()?,
+                TaskCmd::List => task::status(),
+            };
+            println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Some(Commands::Browser { cmd }) => {
             let res = match cmd {
@@ -342,6 +377,12 @@ fn run_mcp() -> Result<()> {
         {"name":"binds","description":"List Hyprland keybinds","inputSchema":{"type":"object","properties":{}}},
         {"name":"clear_screenshots","description":"Clear tracked screenshots (/tmp/hyprfast-*.png) after successful task — deletes files recorded in session and resets list. Use all=true to also delete untracked leftovers.","inputSchema":{"type":"object","properties":{"all":{"type":"boolean"}}}},
         {"name":"session_status","description":"Show screenshot session status (tracked files, bytes, session file path)","inputSchema":{"type":"object","properties":{}}},
+        {"name":"task_init","description":"Task state: init todo list for multi-step action — AI breakdowns goal into steps, starts tracking. Auto-clears when all completed.","inputSchema":{"type":"object","properties":{"goal":{"type":"string","description":"Overall goal e.g. 'play boomshakalaka on youtube'"},"steps":{"type":"array","items":{"type":"string"},"description":"Ordered steps e.g. ['search youtube','click first video','verify playing']"}},"required":["goal","steps"]}},
+        {"name":"task_status","description":"Task state: show current todo list, progress % and next pending step. Use to resume after failure/timeout.","inputSchema":{"type":"object","properties":{}}},
+        {"name":"task_update","description":"Task state: update step status (pending|in_progress|completed|failed|skipped). Auto-clears list when all completed.","inputSchema":{"type":"object","properties":{"index":{"type":"integer","description":"0-based step index"},"id":{"type":"integer","description":"1-based step id (alternative to index)"},"status":{"type":"string","description":"pending|in_progress|completed|failed|skipped"}},"required":["status"]}},
+        {"name":"task_add","description":"Task state: add a new step to current task list","inputSchema":{"type":"object","properties":{"description":{"type":"string"}},"required":["description"]}},
+        {"name":"task_clear","description":"Task state: manually clear current task list","inputSchema":{"type":"object","properties":{}}},
+        {"name":"task_next","description":"Task state: get next pending step (use to decide what to do next)","inputSchema":{"type":"object","properties":{}}},
         // Chrome DevTools / browsermcp parity (hyprfast 0.5)
         {"name":"browser_navigate","description":"CDP: navigate browser tab to URL (auto-discovers ws://9222, creates tab if needed)","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"URL to navigate to"},"target":{"type":"string","description":"optional tab URL/title substring to target"}},"required":["url"]}},
         {"name":"browser_snapshot","description":"CDP: capture accessibility snapshot (AX tree via Accessibility.getFullAXTree, fallback to JS). Returns refs for click/type.","inputSchema":{"type":"object","properties":{}}},
@@ -645,6 +686,28 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
         },
         "clipboard_write" => { let t = args.get("text").and_then(|v| v.as_str()).unwrap_or(""); stagehand::clipboard::write_text(t)?; Ok(serde_json::json!({"ok": true})) },
         "clipboard_read" => Ok(serde_json::json!({"text": stagehand::clipboard::read_text()?})),
+        "task_init" => {
+            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+            if goal.is_empty() { anyhow::bail!("task_init needs goal"); }
+            let steps = args.get("steps").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>()).unwrap_or_default();
+            if steps.is_empty() { anyhow::bail!("task_init needs steps array"); }
+            task::init(goal, steps)
+        },
+        "task_status" => Ok(task::status()),
+        "task_update" => {
+            let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status.is_empty() { anyhow::bail!("task_update needs status"); }
+            let index = args.get("index").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let id = args.get("id").and_then(|v| v.as_u64()).map(|v| v as usize);
+            task::update(index, id, status)
+        },
+        "task_add" => {
+            let desc = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if desc.is_empty() { anyhow::bail!("task_add needs description"); }
+            task::add(desc)
+        },
+        "task_clear" => task::clear(),
+        "task_next" => task::next_pending(),
         _ => anyhow::bail!("unknown tool {}", name),
     }
 }

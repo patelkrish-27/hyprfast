@@ -1,6 +1,6 @@
 [package]
 name = "hyprfast"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Fast hypruse alternative: persistent Hyprland IPC + direct AT-SPI + CDP browser automation, MCP + CLI"
 license = "MIT"
