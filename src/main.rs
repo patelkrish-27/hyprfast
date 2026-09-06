@@ -10,6 +10,7 @@ mod task;
 mod cdp;
 mod browser;
 mod stagehand;
+mod ground;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -115,6 +116,12 @@ enum Commands {
     Task { #[command(subcommand)] cmd: TaskCmd },
     Browser { #[command(subcommand)] cmd: BrowserCmd },
     Stagehand { #[command(subcommand)] cmd: StagehandCmd },
+    /// Fast visual grounding: screenshot + Gemini Flash -> {x,y}
+    Ground { instruction: String, #[arg(long)] window: Option<String>, #[arg(long)] region: Option<String> },
+    /// Fused ground+click/type in one call (Astra-like, no N LLM turns)
+    ActFast { instruction: String, #[arg(long, default_value="click")] action: String, #[arg(long, default_value="")] text: String, #[arg(long)] window: Option<String> },
+    /// Batch fused steps: JSON array [{instruction,action,text}]
+    ActBatch { steps: String, #[arg(long)] window: Option<String> },
     Mcp,
 }
 
@@ -337,6 +344,19 @@ fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
+        Some(Commands::Ground { instruction, window, region }) => {
+            let v = ground::ground(&instruction, &window.unwrap_or_default(), &region.unwrap_or_default())?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::ActFast { instruction, action, text, window }) => {
+            let v = ground::act_fast(&instruction, &action, &text, &window.unwrap_or_default())?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::ActBatch { steps, window }) => {
+            let v: Value = serde_json::from_str(&steps).unwrap_or(Value::Null);
+            let out = ground::act_batch(&v, &window.unwrap_or_default())?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
         Some(Commands::Mcp) | None => { run_mcp()?; }
     }
     Ok(())
@@ -413,7 +433,10 @@ fn run_mcp() -> Result<()> {
         {"name":"context_cookies","description":"Stagehand context.cookies: get cookies","inputSchema":{"type":"object","properties":{}}},
         {"name":"cookies_set","description":"Set cookies via Storage.setCookies","inputSchema":{"type":"object","properties":{"cookies":{"type":"array"}}}},
         {"name":"clipboard_write","description":"Clipboard write via CDP","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
-        {"name":"clipboard_read","description":"Clipboard read via CDP","inputSchema":{"type":"object","properties":{}}}
+        {"name":"clipboard_read","description":"Clipboard read via CDP","inputSchema":{"type":"object","properties":{}}},
+        {"name":"ground","description":"Fast visual grounding: screenshot + Gemini Flash -> {x,y} global coords. Works on canvas/draw/color-pickers where AX has no tree.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"window":{"type":"string"},"region":{"type":"string"}},"required":["instruction"]}},
+        {"name":"act_fast","description":"Fused ground+click/type/key in ONE call (Astra-like). instruction + action click|type|key + text. No snapshot loop.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string"},"text":{"type":"string"},"window":{"type":"string"}},"required":["instruction"]}},
+        {"name":"act_batch","description":"Batch fused steps [{instruction,action,text}] in one MCP call. Max 12 steps.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"]}}
     ]);
     for line in reader.lines() {
         let line = line?;
@@ -708,6 +731,24 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
         },
         "task_clear" => task::clear(),
         "task_next" => task::next_pending(),
+        "ground" => {
+            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+            let window = args.get("window").and_then(|v| v.as_str()).unwrap_or("");
+            let region = args.get("region").and_then(|v| v.as_str()).unwrap_or("");
+            ground::ground(instruction, window, region)
+        },
+        "act_fast" => {
+            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let window = args.get("window").and_then(|v| v.as_str()).unwrap_or("");
+            ground::act_fast(instruction, action, text, window)
+        },
+        "act_batch" => {
+            let steps = args.get("steps").cloned().unwrap_or(Value::Null);
+            let window = args.get("window").and_then(|v| v.as_str()).unwrap_or("");
+            ground::act_batch(&steps, window)
+        },
         _ => anyhow::bail!("unknown tool {}", name),
     }
 }

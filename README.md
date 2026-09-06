@@ -1,7 +1,6 @@
 # hyprfast — fast hypruse alternative (Rust)
 
 **hypruse is slow because it forks.** `hyprfast` fixes that.
-
 | hypruse 0.9.4 (Python) | hyprfast 0.6.1 (Rust) | speedup |
 |---|---|---|
 | `hyprctl` fork per query (5 queries = 5 forks + Python startup) | Direct Unix socket to `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock` , no fork | **~10-150×** (3ms vs 471ms cold, 33ms warm) |
@@ -51,6 +50,13 @@ hyprfast hypr focus 0x55a6953facd0
 hyprfast launch "foot" --workspace 2
 hyprfast ui --name "Save"
 hyprfast click "Save"
+
+# Astra-like visual grounding (v0.7 — works on canvas/draw/color-pickers, no AX tree needed)
+hyprfast ground "the Brave address bar URL field"
+hyprfast act-fast "the Login button" --action click
+hyprfast act-fast "the search input" --action type --text "hello"
+hyprfast act-batch '[{"instruction":"search input","action":"click"},{"instruction":"first result","action":"click"}]'
+# GROUND_MODEL=gemini-3.5-flash-lite for ~2x speed (default gemini-2.5-flash, key from ~/.config/hyprfast/stagehand.env)
 
 # Browser (CDP, no Node) — hyprfast 0.5
 hyprfast browser open https://example.com --workspace 3  # launches brave with --remote-debugging-port=9222
@@ -113,6 +119,7 @@ See `src/stagehand/mod.rs:1` for module map; skipped `sdk-go`/`sdk-python`/`exam
 - [x] v0.5: CDP browser automation — pure Rust, no `@browsermcp/mcp`/playwright needed (`src/cdp/mod.rs:30`, `src/browser/mod.rs:1`)
 - [x] v0.6: Stagehand runtime — full port of `browserbase/stagehand` `act`/`observe`/`extract`/`agent` hybrid AX + LLM (self-heal, cache, batch, WebMCP) into Rust (`src/stagehand/*`), 41 MCP tools (`Cargo.toml:3` `0.6.0`)
 - [x] v0.6.1: Task State — persistent todo `$XDG_RUNTIME_DIR/hyprfast-tasks.json` for multi-step resume (`task_init/status/update/next/add/clear`, `src/task.rs:1`), 47 MCP tools (`Cargo.toml:3` `0.6.1`)
+- [x] v0.7: Astra-like visual grounding — `ground` (screenshot JPEG 0.5x + Gemini Flash vision → `{x,y}`, `src/ground.rs:1`), fused `act_fast`/`act_batch` (ground+click/type in ONE MCP call, OS pointer = trusted gesture for canvas/draw/color-pickers), CDP ws_url 2s cache (`src/cdp/mod.rs:63`), 50 MCP tools
 
 ## Why not just optimize hypruse?
 

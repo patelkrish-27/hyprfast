@@ -62,6 +62,23 @@ pub fn version() -> Result<Value> {
     })
 }
 
+// WS discovery cache: GET /json per CDP call costs 10-30ms + wrong-tab flapping.
+// Cache last-page ws_url for 2s when no explicit target match (v0.7 persistent-CDP-lite).
+static WS_CACHE: std::sync::OnceLock<std::sync::Mutex<(String, std::time::Instant)>> = std::sync::OnceLock::new();
+fn ws_cached() -> Option<String> {
+    let lock = WS_CACHE.get_or_init(|| std::sync::Mutex::new((String::new(), std::time::Instant::now() - Duration::from_secs(10))));
+    let (url, at) = lock.lock().ok()?.clone();
+    if url.is_empty() || at.elapsed() > Duration::from_secs(2) { return None; }
+    Some(url)
+}
+fn ws_store(url: &str) {
+    if let Some(lock) = WS_CACHE.get() {
+        if let Ok(mut g) = lock.lock() { *g = (url.to_string(), std::time::Instant::now()); }
+    } else {
+        let _ = WS_CACHE.set(std::sync::Mutex::new((url.to_string(), std::time::Instant::now())));
+    }
+}
+
 pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> {
     let targets = list_targets_async().await?;
     if targets.is_empty() {
@@ -86,6 +103,13 @@ pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> 
 }
 
 pub fn get_ws_url(target_match: Option<&str>) -> Result<String> {
+    // Fast path: cached discovery for untargeted calls (saves GET /json ~10-30ms).
+    if target_match.map(|s| s.is_empty()).unwrap_or(true) {
+        if let Some(cached) = ws_cached() { return Ok(cached); }
+        let fresh = rt().block_on(get_ws_url_async(target_match))?;
+        ws_store(&fresh);
+        return Ok(fresh);
+    }
     rt().block_on(get_ws_url_async(target_match))
 }
 

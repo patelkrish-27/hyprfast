@@ -58,6 +58,7 @@ pub fn capture(window: &str, region: &str, scale: f64) -> Result<(Vec<u8>, Value
         meta["target"] = Value::String("monitor".into());
         meta["monitor"] = Value::String(name.to_string());
         meta["geometry"] = serde_json::json!([x,y,w,h]);
+        geom = [x,y,w,h];
         base_scale = mon.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
     }
 
