@@ -2137,6 +2137,35 @@ async fn discover_browser_ws_url(host: &str, port: u16) -> RuntimeResult<String>
         })
 }
 
+/// Wait for process shutdown signals (SIGTERM / SIGINT on unix, Ctrl-C
+/// elsewhere). Phase 16.1 Task 3: feeds `initiate_shutdown` so SIGTERM runs
+/// the full rule-15 teardown instead of dying with the socket in place.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix as usig;
+        let mut term = match usig::signal(usig::SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match usig::signal(usig::SignalKind::interrupt()) {
+            Ok(mut int) => {
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = int.recv() => {},
+                }
+            }
+            Err(_) => {
+                term.recv().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Run the daemon: bind (Starting) → connect browser (Connecting) →
 /// Connected, serving until `stop`. Owns the single [`BrowserRuntime`].
 ///
@@ -2156,6 +2185,21 @@ pub async fn serve(opts: ServeOptions) -> RuntimeResult<()> {
     let accept_handle = tokio::spawn(async move {
         accept_server.accept_loop(listener).await;
     });
+
+    // Phase 16.1 Task 3 (contract rule 15): SIGTERM/SIGINT must run the
+    // complete shutdown sequence — stop accepting, drain in-flight, close
+    // WS, remove Unix socket — not kill the process mid-request leaving a
+    // stale socket behind (Phase 16 scenario [13]: socket still present
+    // after SIGTERM). Route signals through the idempotent
+    // `initiate_shutdown` so the normal path below (accept loop exit →
+    // teardown → socket removal → Stopped) runs unchanged.
+    {
+        let sig_server = server.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            sig_server.initiate_shutdown().await;
+        });
+    }
 
     server.transition(LifecycleState::Connecting).await;
     match discover_browser_ws_url(&opts.cdp_host, opts.cdp_port).await {
@@ -2178,11 +2222,15 @@ pub async fn serve(opts: ServeOptions) -> RuntimeResult<()> {
                 // no lifecycle event between connect and first status is missed (DoD ×50 test).
                 // Phase 5: dispatcher forwards to target manager in wire order (I9).
                 // Phase 6: also forwards to FrameManager (ANY frame bumps frame_tree_version).
-                let dispatcher = EventDispatcher::new_with_all(
+                // Phase 12: also forwards to DomDiffEngine for incremental DOM updates —
+                // without this the ElementIndex is never populated in production and
+                // mutation-triggered staleness (I7/§6) cannot function (Phase 16.1 Task 4).
+                let dispatcher = EventDispatcher::new_with_diff(
                     rt_clone.clone(),
                     server.dom_state.clone(),
                     Some(server.target_manager.clone()),
                     Some(server.frame_manager.clone()),
+                    Some(server.dom_diff.clone()),
                 );
                 // Enable DOM/Page/Runtime per attached session (plan requirement).
                 // Best-effort: failures warn but do not fail the daemon (vanishing targets).

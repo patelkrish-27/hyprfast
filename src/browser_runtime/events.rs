@@ -82,7 +82,8 @@ impl EventDispatcher {
         let tm = target_manager.clone();
         let fm = frame_manager.clone();
         let dd = dom_diff.clone();
-        let task = tokio::spawn(dispatch_loop(rx, ds, tm, fm, dd));
+        let rt = runtime.clone();
+        let task = tokio::spawn(dispatch_loop(rx, ds, tm, fm, dd, rt));
         Self {
             runtime,
             dom_state,
@@ -126,31 +127,59 @@ impl EventDispatcher {
     ///
     /// Best-effort per session: a single-vanishing-target failure does not
     /// fail the whole batch (same philosophy as `initialize`'s attach loop).
+    ///
+    /// NOTE: this only covers sessions known at call time. Sessions attached
+    /// later are covered by the `Target.attachedToTarget` hook in
+    /// `dispatch_loop` → `enable_new_session` (Phase 16.1 Task 2).
     pub async fn enable_domains(&self) -> RuntimeResult<()> {
-        let sessions = self.runtime.diagnostics().attached_session_ids;
+        use std::collections::HashSet;
         // Include the browser session itself (None) once, then each flat session.
         // Page/DOM/Runtime enable are idempotent; duplicate enables are harmless.
-        let mut targets: Vec<Option<String>> = vec![None];
-        for sid in sessions {
-            targets.push(Some(sid));
+        // DOM.getDocument is included per flat session (not the browser session):
+        // without it the browser emits no DOM.childNodeInserted/Removed/
+        // attributeModified for the session, so dom_version never advances on
+        // real mutations (Phase 16 Known Issue #1). Sessions attached later
+        // are covered by enable_new_session via the attachedToTarget hook.
+        //
+        // Reconcile loop (Phase 16.1 Task 2): the initial attach burst is read
+        // off the socket asynchronously, so sessions may still be arriving while
+        // this runs. Re-snapshot until no unhandled session remains (bounded).
+        let empty = || Value::Object(serde_json::Map::new());
+        let mut handled: HashSet<String> = HashSet::new();
+        // Browser-level session (None): domains only, no document.
+        for (domain, method) in [
+            ("Page", "Page.enable"),
+            ("DOM", "DOM.enable"),
+            ("Runtime", "Runtime.enable"),
+        ] {
+            let res = self.runtime.call(None, method, empty()).await;
+            match res {
+                Ok(_) => tracing::debug!(domain, "browser-session domain enabled"),
+                Err(e) => tracing::warn!(domain, error = %e, "browser-session domain enable failed; continuing"),
+            }
         }
-        for sid in &targets {
-            for (domain, method) in [
-                ("Page", "Page.enable"),
-                ("DOM", "DOM.enable"),
-                ("Runtime", "Runtime.enable"),
-            ] {
-                let res = self
-                    .runtime
-                    .call(sid.as_deref(), method, Value::Object(serde_json::Map::new()))
-                    .await;
-                match res {
-                    Ok(_) => tracing::debug!(session = ?sid, domain, "domain enabled"),
-                    Err(e) => tracing::warn!(session = ?sid, domain, error = %e, "domain enable failed; continuing"),
-                }
+        for _ in 0..5 {
+            let sessions = self.runtime.diagnostics().attached_session_ids;
+            let fresh: Vec<String> = sessions
+                .into_iter()
+                .filter(|s| !handled.contains(s))
+                .collect();
+            if fresh.is_empty() {
+                break;
+            }
+            for sid in fresh {
+                self.enable_session(&sid).await;
+                handled.insert(sid);
             }
         }
         Ok(())
+    }
+
+    /// Enable domains + fetch the document for one newly attached session.
+    /// Thin wrapper over the free [`enable_new_session`] used by the
+    /// `Target.attachedToTarget` hook below.
+    pub async fn enable_session(&self, session_id: &str) {
+        enable_new_session(&self.runtime, session_id).await;
     }
 
     /// Liftable wait primitive — now delegated to the single engine in `wait.rs`.
@@ -222,6 +251,7 @@ async fn dispatch_loop(
     target_manager: Option<Arc<BrowserTargetManager>>,
     frame_manager: Option<Arc<FrameManager>>,
     dom_diff: Option<Arc<DomDiffEngine>>,
+    runtime: BrowserRuntime,
 ) {
     loop {
         match rx.recv().await {
@@ -239,12 +269,110 @@ async fn dispatch_loop(
                 if let Some(dd) = &dom_diff {
                     dd.on_event_with_pre(&ev, dom_before, eiv_before);
                 }
+                // Phase 16.1 Task 2: every newly attached flat session needs
+                // its own Page/DOM/Runtime enable + DOM.getDocument, otherwise
+                // DOM mutation events (childNodeInserted/Removed/...) never
+                // fire for that session. Detached task so the ordered loop
+                // never blocks on these CDP round-trips (I9/I22); the calls
+                // themselves are sequential per session inside
+                // `enable_new_session`.
+                if ev.method == "Target.attachedToTarget" {
+                    if let Some(sid) = ev
+                        .params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                    {
+                        let sid = sid.to_string();
+                        let rt = runtime.clone();
+                        tokio::spawn(async move {
+                            enable_new_session(&rt, &sid).await;
+                        });
+                    }
+                }
+                // Phase 16.1 Task 2 (part 2): a navigation replaces the
+                // document that DOM.getDocument subscribed the session to
+                // (the browser emits DOM.documentUpdated, ×2 per navigation
+                // in live probing). Until getDocument is re-issued, descendant
+                // mutations on the new document emit NOTHING — verified live:
+                // mutate-after-nav with no re-get → 0 events; with re-get →
+                // childNodeInserted fires. So re-fetch the full tree on every
+                // documentUpdated for that event's own session. getDocument is
+                // a pure query (emits no events itself), so this cannot loop.
+                // Detached task, same ordering rationale as above.
+                if ev.method == "DOM.documentUpdated" {
+                    if let Some(sid) = ev.session_id.clone() {
+                        let rt = runtime.clone();
+                        tokio::spawn(async move {
+                            match rt
+                                .call(
+                                    Some(&sid),
+                                    "DOM.getDocument",
+                                    serde_json::json!({"depth": -1, "pierce": true}),
+                                )
+                                .await
+                            {
+                                Ok(_) => tracing::debug!(session_id = %sid, "documentUpdated: re-fetched document"),
+                                Err(e) => tracing::warn!(session_id = %sid, error = %e, "documentUpdated: re-fetch failed; continuing"),
+                            }
+                        });
+                    }
+                }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(lagged = n, "EventDispatcher lagged — some events dropped; state may be stale; DomState will self-heal on next full invalidation");
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-session domain enable (Phase 16.1 Task 2)
+// ---------------------------------------------------------------------------
+
+/// Enable `Page`/`DOM`/`Runtime` and fetch the document for ONE newly
+/// attached flat session, sequentially and best-effort.
+///
+/// Background: `enable_domains` runs only at daemon connect/reconnect, so
+/// every target attached later via `Target.attachedToTarget` (the first
+/// page target at startup included) never received these calls — and
+/// `DOM.getDocument` was never issued at all. Without them the browser
+/// emits no `DOM.childNodeInserted/Removed/attributeModified` events for
+/// the session, so `dom_version` never advances on real DOM mutations
+/// (Phase 16 Known Issue #1: dom 72→72, events 345→345 after a real
+/// node insertion).
+///
+/// Best-effort: attach races with target teardown (popup closed before we
+/// enable, non-page targets that reject Page.enable) must warn, never
+/// panic and never fail the dispatcher.
+pub async fn enable_new_session(runtime: &BrowserRuntime, session_id: &str) {
+    let empty = || Value::Object(serde_json::Map::new());
+    for (domain, method) in [
+        ("Page", "Page.enable"),
+        ("DOM", "DOM.enable"),
+        ("Runtime", "Runtime.enable"),
+    ] {
+        match runtime.call(Some(session_id), method, empty()).await {
+            Ok(_) => tracing::debug!(session_id, domain, "new-session domain enabled"),
+            Err(e) => tracing::warn!(session_id, domain, error = %e, "new-session domain enable failed; continuing"),
+        }
+    }
+    // Gives the browser a document tree to track mutations against for this
+    // session; without it DOM.childNodeInserted never fires here. Must be a
+    // FULL-tree request (depth -1): an empty-params getDocument does NOT
+    // subscribe the session to descendant mutation events (verified live:
+    // empty params → 0 events on real insertion; depth -1 → childNodeInserted
+    // fires). Pierce covers open shadow roots, matching element_index.
+    match runtime
+        .call(
+            Some(session_id),
+            "DOM.getDocument",
+            serde_json::json!({"depth": -1, "pierce": true}),
+        )
+        .await
+    {
+        Ok(_) => tracing::debug!(session_id, "new-session DOM.getDocument ok"),
+        Err(e) => tracing::warn!(session_id, error = %e, "new-session DOM.getDocument failed; continuing"),
     }
 }
 
