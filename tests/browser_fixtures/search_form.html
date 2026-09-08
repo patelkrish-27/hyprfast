@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>search form fixture</title>
+</head>
+<body>
+<h1 id="heading">Search form fixture</h1>
+<form id="search-form" action="search_form.html" method="get">
+  <label for="search-input">Search</label>
+  <input id="search-input" name="q" type="search" autocomplete="off">
+  <button id="search-submit" type="submit">Search</button>
+</form>
+<div id="search-results" role="status">no query</div>
+<script>
+// Reflect the ?q= query param so submit -> URL change -> extract works.
+const q = new URLSearchParams(window.location.search).get('q');
+if (q !== null) {
+  document.getElementById('search-input').value = q;
+  document.getElementById('search-results').textContent = 'results for: ' + q;
+}
+</script>
+</body>
+</html>

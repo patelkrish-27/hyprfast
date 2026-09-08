@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>broken login fixture</title>
+</head>
+<body>
+<h1 id="heading">Broken login fixture</h1>
+<p>Submitting this login form deliberately does NOT navigate anywhere,
+so a plan step expecting post-login navigation must verify as
+Contradicted (genuine failure), not Inconclusive.</p>
+<form id="login-form" action="javascript:void(0)">
+  <label for="username">Username</label>
+  <input id="username" name="username" type="text" autocomplete="username">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password">
+  <button id="login-submit" type="submit">Log in</button>
+</form>
+<div id="login-status" role="status">not submitted</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  // Broken backend: show an inline error, never navigate.
+  document.getElementById('login-status').textContent = 'login failed: invalid credentials';
+});
+</script>
+</body>
+</html>

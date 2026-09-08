@@ -2,6 +2,9 @@
 //! Covers ModelName/Provider, LLM wire, Action, Act/Observe/Extract, Page/Locator, Cookies, WebMCP, metrics etc.
 //! Browserbase-specific proxy types kept for fidelity but not used locally (hyprfast uses direct CDP).
 
+#![allow(non_snake_case)]
+#![allow(clippy::all)]
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

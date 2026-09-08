@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>popup fixture</title>
+</head>
+<body>
+<h1 id="heading">Popup fixture</h1>
+<button id="open-popup" type="button">Open popup</button>
+<div id="status" role="status">idle</div>
+<script>
+document.getElementById('open-popup').addEventListener('click', () => {
+  // Real window.open popup (not a modal div) so targetCreated /
+  // attachedToTarget discovery can be exercised.
+  const popup = window.open('basic.html', 'fixture-popup', 'width=400,height=300');
+  document.getElementById('status').textContent = popup ? 'popup-opened' : 'popup-blocked';
+});
+</script>
+</body>
+</html>

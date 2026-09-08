@@ -1,7 +1,10 @@
 //! Port of packages/extension/understudy/a11y/snapshot/xpathUtils.ts + dom/a11yScripts/index.ts nodeToAbsoluteXPath
+//! Phase 3: transport via BrowserRuntimeClient (capability none, read-only). NODE_TO_XPATH_JS preserved.
 
 use anyhow::Result;
 use serde_json::json;
+use crate::browser_runtime::server::CapabilityClass;
+use crate::browser_runtime::client as rt_client;
 
 const NODE_TO_XPATH_JS: &str = r#"
 function() {
@@ -41,32 +44,30 @@ function() {
 
 /// Build absolute xpath from iframe chain + leaf — mirrors buildAbsoluteXPathFromChain
 pub fn build_absolute_xpath_from_chain(chain: &[(String, u32)], leaf_backend: u32) -> Result<Option<String>> {
-    let ws = crate::cdp::get_ws_url(None)?;
     let mut prefix = String::new();
     for (_, backend) in chain {
-        if let Some(xp) = absolute_xpath_for_backend_node_inner(&ws, *backend)? {
+        if let Some(xp) = absolute_xpath_for_backend_node_inner(*backend)? {
             prefix = if prefix.is_empty() { normalize_xpath(&xp) } else { prefix_xpath(&prefix, &xp) };
         }
     }
-    let leaf = absolute_xpath_for_backend_node_inner(&ws, leaf_backend)?;
+    let leaf = absolute_xpath_for_backend_node_inner(leaf_backend)?;
     Ok(match leaf {
         Some(l) => Some(if prefix.is_empty() { normalize_xpath(&l) } else { prefix_xpath(&prefix, &l) }),
         None => Some(if prefix.is_empty() { "/".to_string() } else { prefix }),
     })
 }
 
-fn absolute_xpath_for_backend_node_inner(ws: &str, backend: u32) -> Result<Option<String>> {
-    let resolved = crate::cdp::cdp_call(ws, "DOM.resolveNode", json!({"backendNodeId": backend}))?;
+fn absolute_xpath_for_backend_node_inner(backend: u32) -> Result<Option<String>> {
+    let resolved = rt_client::cdp_call_sync("DOM.resolveNode", json!({"backendNodeId": backend}), None, None, CapabilityClass::None)?;
     let oid = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str());
     let Some(oid) = oid else { return Ok(None) };
-    let r = crate::cdp::cdp_call(ws, "Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": NODE_TO_XPATH_JS, "returnByValue": true}))?;
-    let _ = crate::cdp::cdp_call(ws, "Runtime.releaseObject", json!({"objectId": oid}));
+    let r = rt_client::cdp_call_sync("Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": NODE_TO_XPATH_JS, "returnByValue": true}), None, None, CapabilityClass::None)?;
+    let _ = rt_client::cdp_call_sync("Runtime.releaseObject", json!({"objectId": oid}), None, None, CapabilityClass::None);
     Ok(r.get("result").and_then(|x| x.get("value")).and_then(|v| v.as_str()).map(|s| s.to_string()))
 }
 
 pub fn absolute_xpath_for_backend_node(backend: u32) -> Result<Option<String>> {
-    let ws = crate::cdp::get_ws_url(None)?;
-    absolute_xpath_for_backend_node_inner(&ws, backend)
+    absolute_xpath_for_backend_node_inner(backend)
 }
 
 pub fn prefix_xpath(parent_abs: &str, child: &str) -> String {
@@ -80,7 +81,6 @@ pub fn prefix_xpath(parent_abs: &str, child: &str) -> String {
 pub fn normalize_xpath(x: &str) -> String {
     if x.is_empty() { return String::new() }
     let mut s = x.trim().trim_start_matches(|c| c=='x'||c=='X').to_string();
-    // handle xpath= prefix case
     if s.to_lowercase().starts_with("xpath=") { s = s[5..].to_string(); }
     s = s.trim().to_string();
     if !s.starts_with('/') { s = format!("/{}", s); }

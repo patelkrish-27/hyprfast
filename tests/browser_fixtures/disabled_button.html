@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>disabled button fixture</title>
+</head>
+<body>
+<h1 id="heading">Disabled button fixture</h1>
+<button id="disabled-button" type="button" disabled>Cannot click me</button>
+<button id="enable-button" type="button" onclick="document.getElementById('disabled-button').disabled = false">Enable</button>
+<div id="status" role="status">idle</div>
+<script>
+document.getElementById('disabled-button').addEventListener('click', () => {
+  document.getElementById('status').textContent = 'clicked';
+});
+</script>
+</body>
+</html>

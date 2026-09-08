@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ambiguous buttons fixture</title>
+</head>
+<body>
+<h1 id="heading">Ambiguous buttons fixture</h1>
+<p>Two buttons share the exact same accessible name and label.</p>
+<button id="submit-a" type="button" onclick="document.getElementById('status').textContent = 'a'">Submit</button>
+<button id="submit-b" type="button" onclick="document.getElementById('status').textContent = 'b'">Submit</button>
+<div id="status" role="status">idle</div>
+</body>
+</html>

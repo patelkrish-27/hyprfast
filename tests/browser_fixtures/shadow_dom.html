@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>shadow dom fixture</title>
+</head>
+<body>
+<h1 id="heading">Shadow DOM fixture</h1>
+<div id="shadow-host"></div>
+<div id="status" role="status">idle</div>
+<script>
+const host = document.getElementById('shadow-host');
+// Open shadow root with a real button inside.
+const root = host.attachShadow({ mode: 'open' });
+const btn = document.createElement('button');
+btn.id = 'shadow-button';
+btn.type = 'button';
+btn.textContent = 'Shadow button';
+btn.addEventListener('click', () => {
+  document.getElementById('status').textContent = 'shadow-clicked';
+});
+root.appendChild(btn);
+</script>
+</body>
+</html>

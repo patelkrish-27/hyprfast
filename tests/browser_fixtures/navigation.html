@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>navigation fixture</title>
+</head>
+<body>
+<h1 id="heading">Navigation fixture</h1>
+<p>Clicking the link below navigates after a deliberate delay, so lifecycle
+event timing (not fixed sleeps) can be exercised.</p>
+<a id="delayed-link" href="instant.html">Go to instant page</a>
+<button id="delayed-nav-button" type="button">Delayed navigate</button>
+<div id="status" role="status">idle</div>
+<script>
+// Delayed navigation via JS timer: 1500ms after click.
+document.getElementById('delayed-nav-button').addEventListener('click', () => {
+  document.getElementById('status').textContent = 'navigating';
+  setTimeout(() => {
+    window.location.href = 'instant.html';
+  }, 1500);
+});
+</script>
+</body>
+</html>

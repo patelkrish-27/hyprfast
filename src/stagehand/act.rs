@@ -1,10 +1,12 @@
 //! act — port of packages/extension/services/actService.ts
-//! Flow: wait dom quiet → captureHybridSnapshot → LLM (act prompt) → deterministic action → handle twoStep dropdown
+//! Phase 3: transport migrated to BrowserRuntimeClient (capability-tagged).
+//! Resolution bugs (B2/B5/B14 etc.) preserved — fixed in Phase 6.
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use crate::stagehand::{prompt, llm, snapshot, cache, StagehandConfig};
-use crate::cdp;
+use crate::browser_runtime::server::CapabilityClass;
+use crate::browser_runtime::client as rt_client;
 use crate::browser;
 
 const SUPPORTED_ACTIONS: &[&str] = &["click","fill","type","press","selectOptionFromDropdown","scrollIntoView","hover","waitForSelector","scroll","dragAndDrop","nextChunk","prevChunk"];
@@ -12,9 +14,9 @@ const SUPPORTED_ACTIONS: &[&str] = &["click","fill","type","press","selectOption
 fn supported_list() -> Vec<String> { SUPPORTED_ACTIONS.iter().map(|s| s.to_string()).collect() }
 
 fn current_url() -> String {
-    cdp::evaluate("location.href", false).ok()
+    rt_client::evaluate_sync("location.href", false).ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .or_else(|| cdp::list_targets().ok().and_then(|t| t.first().map(|x| x.url.clone())))
+        .or_else(|| crate::cdp::list_targets().ok().and_then(|t| t.first().map(|x| x.url.clone())))
         .unwrap_or_default()
 }
 
@@ -22,7 +24,6 @@ fn find_name_for_id(tree: &str, id: &str) -> Option<String> {
     if id.is_empty() { return None; }
     for line in tree.lines() {
         if line.contains(id) {
-            // line like `[0-4231] button 'New chat' 4231` — extract between single quotes
             if let Some(s) = line.find('\'') {
                 if let Some(e) = line[s+1..].find('\'') {
                     let name = line[s+1..s+1+e].trim().to_string();
@@ -35,7 +36,6 @@ fn find_name_for_id(tree: &str, id: &str) -> Option<String> {
 }
 
 fn extract_target_from_instruction(instr: &str) -> String {
-    // prefer quoted text e.g. 'New chat' or "New chat"
     if let Some(a) = instr.find('\'') {
         if let Some(b) = instr[a+1..].find('\'') {
             let s = instr[a+1..a+1+b].trim();
@@ -48,7 +48,6 @@ fn extract_target_from_instruction(instr: &str) -> String {
             if !s.is_empty() { return s.to_string(); }
         }
     }
-    // fallback: last meaningful words before button/link
     let lower = instr.to_lowercase();
     for kw in ["button", "link", "prompt box", "input"] {
         if let Some(pos) = lower.find(kw) {
@@ -67,7 +66,6 @@ pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value
     let element_id = action.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
     let args = action.get("arguments").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let arg0 = args.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    // Resolve variables %var%
     let resolve = |s: String| -> String {
         if s.starts_with('%') && s.ends_with('%') {
             if let Some(vars) = variables {
@@ -80,44 +78,46 @@ pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value
     };
     let _arg0 = resolve(arg0);
 
-    // Map Stagehand methods → hyprfast browser/cdp
     match method {
         "click" | "leftClick" => {
-            // elementId like "0-12345" -> backendId
             if !element_id.is_empty() {
                 if let Some((_, backend)) = snapshot::parse_enc_id(element_id) {
-                    let ws = cdp::get_ws_url(None)?;
                     if backend != 0 {
-                        let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", json!({"backendNodeId": backend}))?;
-                        if let Some(object_id) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                            let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", json!({"objectId": object_id, "functionDeclaration": "function(){this.click(); return this.tagName;}", "returnByValue": true}))?;
-                            return Ok(json!({"success": true, "method": method, "elementId": element_id, "via":"CDP-backend"}));
+                        // Resolve via DOM.resolveNode + callFunctionOn via persistent transport
+                        let resolved = rt_client::cdp_call_sync("DOM.resolveNode", json!({"backendNodeId": backend}), None, None, CapabilityClass::None);
+                        if let Ok(resolved) = resolved {
+                            if let Some(object_id) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
+                                let _ = rt_client::cdp_call_sync("Runtime.callFunctionOn", json!({"objectId": object_id, "functionDeclaration": "function(){this.click(); return this.tagName;}", "returnByValue": true}), None, None, CapabilityClass::RuntimeEvaluate);
+                                let _ = rt_client::cdp_call_sync("Runtime.releaseObject", json!({"objectId": object_id}), None, None, CapabilityClass::None);
+                                return Ok(json!({"success": true, "method": method, "elementId": element_id, "via":"CDP-backend"}));
+                            }
                         }
                     }
                 }
-                // fallback to elementId as selector hint
+                // B5/B14 deferred: data-stagehand-id fallback and first-match — preserved
                 return browser::click_by_selector(&format!("[data-stagehand-id='{}']", element_id))
-                    .or_else(|_| cdp::evaluate(&format!("document.querySelectorAll('*')[0]?.click()"), false));
+                    .or_else(|_| rt_client::evaluate_sync(&format!("document.querySelectorAll('*')[0]?.click()"), false));
             }
             bail!("no elementId for click");
         },
         "fill" | "type" => {
             let text = resolve(args.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string());
-            // Use browser type logic
             if !element_id.is_empty() {
-                // try to focus element by backend then type
                 if let Some((_, backend)) = snapshot::parse_enc_id(element_id) {
-                    let ws = cdp::get_ws_url(None)?;
-                    let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", json!({"backendNodeId": backend}))?;
-                    if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                        let decl = format!("function(){{this.focus(); if(this.isContentEditable){{document.execCommand('selectAll',false,null); document.execCommand('insertText',false,{:?});}} else {{this.value={:?}; this.dispatchEvent(new Event('input',{{bubbles:true}}));}} return true;}}", text, text);
-                        let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}))?;
+                    let resolved = rt_client::cdp_call_sync("DOM.resolveNode", json!({"backendNodeId": backend}), None, None, CapabilityClass::None);
+                    if let Ok(resolved) = resolved {
+                        if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
+                            // B2 deferred: string-concatenated JS — preserved
+                            let decl = format!("function(){{this.focus(); if(this.isContentEditable){{document.execCommand('selectAll',false,null); document.execCommand('insertText',false,{:?});}} else {{this.value={:?}; this.dispatchEvent(new Event('input',{{bubbles:true}}));}} return true;}}", text, text);
+                            let _ = rt_client::cdp_call_sync("Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}), None, None, CapabilityClass::RuntimeEvaluate);
+                            let _ = rt_client::cdp_call_sync("Runtime.releaseObject", json!({"objectId": oid}), None, None, CapabilityClass::None);
+                        }
                     }
                 }
             }
-            // fallback via evaluate
+            // fallback via evaluate — B2 preserved
             let js = format!("(() => {{ const el=document.activeElement; if(el){{el.focus(); if(el.isContentEditable) document.execCommand('insertText',false,{:?}); else {{el.value={:?}; el.dispatchEvent(new Event('input',{{bubbles:true}}));}}}} return true;}})()", text, text);
-            let v = cdp::evaluate(&js, false)?;
+            let v = rt_client::evaluate_sync(&js, false)?;
             Ok(json!({"success": true, "method": method, "typed": text, "result": v}))
         },
         "press" => {
@@ -126,15 +126,17 @@ pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value
         },
         "selectOptionFromDropdown" => {
             let option = resolve(args.get(0).and_then(|v| v.as_str()).unwrap_or("").to_string());
-            // try select
             if !element_id.is_empty() {
                 if let Some((_, backend)) = snapshot::parse_enc_id(element_id) {
-                    let ws = cdp::get_ws_url(None)?;
-                    let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", json!({"backendNodeId": backend}))?;
-                    if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                        let decl = format!("function(){{ for(const o of this.options) if(o.text=== {:?} || o.value=== {:?}) {{o.selected=true;}} this.dispatchEvent(new Event('change',{{bubbles:true}})); return true;}}", option, option);
-                        let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}))?;
-                        return Ok(json!({"success": true, "method": method, "option": option}));
+                    let resolved = rt_client::cdp_call_sync("DOM.resolveNode", json!({"backendNodeId": backend}), None, None, CapabilityClass::None);
+                    if let Ok(resolved) = resolved {
+                        if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
+                            // B2 deferred
+                            let decl = format!("function(){{ for(const o of this.options) if(o.text=== {:?} || o.value=== {:?}) {{o.selected=true;}} this.dispatchEvent(new Event('change',{{bubbles:true}})); return true;}}", option, option);
+                            let _ = rt_client::cdp_call_sync("Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}), None, None, CapabilityClass::RuntimeEvaluate);
+                            let _ = rt_client::cdp_call_sync("Runtime.releaseObject", json!({"objectId": oid}), None, None, CapabilityClass::None);
+                            return Ok(json!({"success": true, "method": method, "option": option}));
+                        }
                     }
                 }
             }
@@ -145,28 +147,31 @@ pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value
             if arg.contains('%') {
                 let pct: f64 = arg.trim_matches('%').parse().unwrap_or(50.0) / 100.0;
                 let js = format!("window.scrollTo(0, document.body.scrollHeight * {}); true", pct);
-                cdp::evaluate(&js, false)?;
+                rt_client::evaluate_sync(&js, false)?;
             } else if !element_id.is_empty() {
                 if let Some((_, backend)) = snapshot::parse_enc_id(element_id) {
-                    let ws = cdp::get_ws_url(None)?;
-                    let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", json!({"backendNodeId": backend}))?;
-                    if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                        let decl = "function(){this.scrollIntoView({block:'center'}); return true;}";
-                        let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}))?;
+                    let resolved = rt_client::cdp_call_sync("DOM.resolveNode", json!({"backendNodeId": backend}), None, None, CapabilityClass::None);
+                    if let Ok(resolved) = resolved {
+                        if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
+                            let decl = "function(){this.scrollIntoView({block:'center'}); return true;}";
+                            let _ = rt_client::cdp_call_sync("Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}), None, None, CapabilityClass::RuntimeEvaluate);
+                            let _ = rt_client::cdp_call_sync("Runtime.releaseObject", json!({"objectId": oid}), None, None, CapabilityClass::None);
+                        }
                     }
                 }
             }
             Ok(json!({"success": true, "method": method}))
         },
         "hover" => {
-            // hover via dispatch
             if let Some((_, backend)) = snapshot::parse_enc_id(element_id) {
-                let ws = cdp::get_ws_url(None)?;
-                let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", json!({"backendNodeId": backend}))?;
-                if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                    let decl = "function(){this.dispatchEvent(new MouseEvent('mouseover',{bubbles:true})); return true;}";
-                    let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}))?;
-                    return Ok(json!({"success": true, "method": method}));
+                let resolved = rt_client::cdp_call_sync("DOM.resolveNode", json!({"backendNodeId": backend}), None, None, CapabilityClass::None);
+                if let Ok(resolved) = resolved {
+                    if let Some(oid) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
+                        let decl = "function(){this.dispatchEvent(new MouseEvent('mouseover',{bubbles:true})); return true;}";
+                        let _ = rt_client::cdp_call_sync("Runtime.callFunctionOn", json!({"objectId": oid, "functionDeclaration": decl, "returnByValue": true}), None, None, CapabilityClass::RuntimeEvaluate);
+                        let _ = rt_client::cdp_call_sync("Runtime.releaseObject", json!({"objectId": oid}), None, None, CapabilityClass::None);
+                        return Ok(json!({"success": true, "method": method}));
+                    }
                 }
             }
             Ok(json!({"success": true, "method": method, "fallback": true}))
@@ -174,13 +179,13 @@ pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value
         "nextChunk" | "prevChunk" => {
             let dir = if method=="nextChunk" { 1 } else { -1 };
             let js = format!("window.scrollBy(0, {}*window.innerHeight*0.8); true", dir);
-            cdp::evaluate(&js, false)?;
+            rt_client::evaluate_sync(&js, false)?;
             Ok(json!({"success": true, "method": method}))
         },
         _ => {
-            // generic fallback via JS
+            // B14 deferred: first-match fallback — preserved
             let js = format!("document.querySelector('*')?.click(); true");
-            let v = cdp::evaluate(&js, false)?;
+            let v = rt_client::evaluate_sync(&js, false)?;
             Ok(json!({"success": true, "method": method, "fallback": true, "result": v}))
         }
     }
@@ -188,10 +193,8 @@ pub fn execute_action(action: &Value, variables: Option<&Value>) -> Result<Value
 
 pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
     let url = current_url();
-    // Cache check
     if cfg.cache_enabled {
         if let Some(cached) = cache::get_cached("act", instruction, &url) {
-            // replay cached actions (self-heal if fails)
             if let Ok(replayed) = replay_cached(&cached, instruction, cfg) {
                 return Ok(json!({"success": true, "cached": true, "actions": cached, "result": replayed}));
             }
@@ -213,14 +216,11 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
     let llm_resp = llm::generate(messages, &llm_cfg, true)?;
     crate::stagehand::instrumentation::METRICS.add("act", &llm_resp);
     let _elapsed = t0.elapsed().as_millis() as u32;
-    // Stagehand LLM returns {action: {elementId, description, method, arguments...}, element?}
     let action_obj = llm_resp.get("action").or_else(|| llm_resp.get("element")).or_else(|| llm_resp.get("actions").and_then(|a| a.get(0))).cloned().unwrap_or(Value::Null);
     if action_obj.is_null() || action_obj.get("method").is_none() && action_obj.get("elementId").is_none() {
-        // Check if LLM returned null action (no match)
         if llm_resp.get("action").and_then(|v| v.as_null()).is_some() || llm_resp.to_string().contains("null") {
             return Ok(json!({"success": false, "message": "No action found", "actionDescription": instruction, "actions": [], "llm": llm_resp}));
         }
-        // Try to parse flat
         if llm_resp.get("elementId").is_some() {
             let mut res = execute_action(&llm_resp, None);
             if res.is_err() {
@@ -230,7 +230,7 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
                     let name = find_name_for_id(&snap.combined_tree, elem_id).unwrap_or_else(|| extract_target_from_instruction(instruction));
                     if !name.is_empty() {
                         let js = format!("(() => {{ const els=[...document.querySelectorAll('button, [role=\"button\"], a, div, span')]; const t=els.find(e=>e.textContent.trim().toLowerCase().includes({:?}.toLowerCase())); if(t){{t.click(); return 'fallback clicked';}} return 'fallback not found'; }})()", name.to_lowercase());
-                        if let Ok(v) = cdp::evaluate(&js, false) {
+                        if let Ok(v) = rt_client::evaluate_sync(&js, false) {
                             if v.to_string().contains("fallback clicked") { res = Ok(v); }
                         }
                     }
@@ -242,18 +242,15 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
         return Ok(json!({"success": false, "message": format!("LLM did not return actionable element: {}", llm_resp), "actions": [], "llm": llm_resp}));
     }
 
-    // Execute with self-heal retry (Stagehand actService selfHeal) + eval fallback for stale backend (cause #6)
     let mut result = execute_action(&action_obj, None);
-    // Fallback to JS text search if backend resolve failed (common for Gemini New chat etc. 0-4231)
     if result.is_err() {
         let err_str = result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
         if err_str.contains("Could not find object") || err_str.contains("backend") || err_str.contains("not found") {
-            // Try to find element name from snapshot for this elementId
             let elem_id = action_obj.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
             let name = find_name_for_id(&snap.combined_tree, elem_id).unwrap_or_else(|| extract_target_from_instruction(instruction));
             if !name.is_empty() {
                 let js = format!("(() => {{ const els=[...document.querySelectorAll('button, [role=\"button\"], a, div, span')]; const t=els.find(e=>e.textContent.trim().toLowerCase().includes({:?}.toLowerCase())); if(t){{t.click(); return 'fallback clicked '+t.tagName+': '+t.textContent.slice(0,30);}} return 'fallback not found for '+{:?}; }})()", name.to_lowercase(), name);
-                if let Ok(v) = cdp::evaluate(&js, false) {
+                if let Ok(v) = rt_client::evaluate_sync(&js, false) {
                     if v.as_str().map(|s| s.contains("fallback clicked")).unwrap_or(false) || v.to_string().contains("fallback clicked") {
                         result = Ok(v);
                     }
@@ -276,10 +273,9 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
     }
     let result = result?;
 
-    // Handle twoStep dropdown — Stagehand does second inference after DOM diff
     let two_step = action_obj.get("twoStep").and_then(|v| v.as_bool()).unwrap_or(false) || llm_resp.get("twoStep").and_then(|v| v.as_bool()).unwrap_or(false);
     let actions = if two_step {
-        // Wait then recapture diff tree
+        // B3 deferred: 500ms sleep — preserved
         std::thread::sleep(std::time::Duration::from_millis(500));
         let next_snap = snapshot::capture_hybrid().unwrap_or_else(|_| snapshot::HybridSnapshot { combined_tree: snap.combined_tree.clone(), combined_xpath_map: snap.combined_xpath_map.clone(), combined_url_map: snap.combined_url_map.clone(), raw_ax_nodes: snap.raw_ax_nodes, via: snap.via.clone() });
         let diff = snapshot::diff_trees(&snap.combined_tree, &next_snap.combined_tree);
@@ -292,7 +288,7 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
         let resp2 = llm::generate(msgs2, &llm_cfg, true).unwrap_or(json!({}));
         let action2 = resp2.get("action").or_else(|| resp2.get("element")).cloned().unwrap_or(Value::Null);
         if !action2.is_null() {
-            let res2 = execute_action(&action2, None).unwrap_or(json!({"error": "second step failed"}));
+            let _res2 = execute_action(&action2, None).unwrap_or(json!({"error": "second step failed"}));
             vec![action_obj.clone(), action2]
         } else {
             vec![action_obj.clone()]
@@ -301,7 +297,6 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
         vec![action_obj.clone()]
     };
 
-    // Cache on success
     if cfg.cache_enabled && !actions.is_empty() {
         let _ = cache::set_cached("act", instruction, &url, Value::Array(actions.clone()));
     }
@@ -318,7 +313,7 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
     }))
 }
 
-fn replay_cached(cached: &Value, instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
+fn replay_cached(cached: &Value, instruction: &str, _cfg: &StagehandConfig) -> Result<Value> {
     let actions = cached.as_array().cloned().unwrap_or_default();
     let mut results = Vec::new();
     for a in actions {

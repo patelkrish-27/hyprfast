@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>iframe fixture</title>
+</head>
+<body>
+<h1 id="heading">Iframe fixture</h1>
+<p id="outer-para">Outer page. The button below lives inside the iframe.</p>
+<iframe id="inner-frame" name="inner-frame" title="inner frame"
+        srcdoc="<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><title>inner</title></head><body><button id='iframe-button' type='button' onclick=&quot;document.getElementById('iframe-status').textContent='iframe-clicked'&quot;>Inner button</button><div id='iframe-status' role='status'>idle</div></body></html>"
+        width="400" height="200"></iframe>
+<div id="outer-status" role="status">idle</div>
+</body>
+</html>

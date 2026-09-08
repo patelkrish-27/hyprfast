@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mutation fixture</title>
+</head>
+<body>
+<h1 id="heading">Mutation fixture</h1>
+<p>Buttons below mutate the DOM on demand so stale-ref, recovery-ladder,
+and incremental-update tests have a deterministic target.</p>
+<button id="mutate-button" type="button">Replace target</button>
+<button id="add-button" type="button">Add node</button>
+<button id="remove-button" type="button">Remove target</button>
+<button id="attr-button" type="button">Change attribute</button>
+<div id="container">
+  <button id="target-button" type="button" data-version="1"
+          onclick="document.getElementById('status').textContent = 'target-clicked'">Target</button>
+</div>
+<div id="status" role="status">idle</div>
+<script>
+let version = 1;
+function freshTarget() {
+  const b = document.createElement('button');
+  b.id = 'target-button';
+  b.type = 'button';
+  b.dataset.version = String(++version);
+  b.textContent = 'Target';
+  b.addEventListener('click', () => {
+    document.getElementById('status').textContent = 'target-clicked';
+  });
+  return b;
+}
+// Replace the target node with a new node carrying the same id/selector
+// but a new identity (new backendNodeId).
+document.getElementById('mutate-button').addEventListener('click', () => {
+  const old = document.getElementById('target-button');
+  if (old) old.replaceWith(freshTarget());
+  document.getElementById('status').textContent = 'mutated';
+});
+document.getElementById('add-button').addEventListener('click', () => {
+  const p = document.createElement('p');
+  p.className = 'added-node';
+  p.textContent = 'added ' + Date.now();
+  document.getElementById('container').appendChild(p);
+  document.getElementById('status').textContent = 'added';
+});
+document.getElementById('remove-button').addEventListener('click', () => {
+  const old = document.getElementById('target-button');
+  if (old) old.remove();
+  document.getElementById('status').textContent = 'removed';
+});
+document.getElementById('attr-button').addEventListener('click', () => {
+  const t = document.getElementById('target-button');
+  if (t) t.setAttribute('data-state', 'changed');
+  document.getElementById('status').textContent = 'attr-changed';
+});
+</script>
+</body>
+</html>

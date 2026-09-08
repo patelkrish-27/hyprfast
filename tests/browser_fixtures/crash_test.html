@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>crash test fixture</title>
+</head>
+<body>
+<h1 id="heading">Crash test fixture</h1>
+<p>Helpers for crash / disconnect / recovery scenarios. Each button
+triggers a distinct real browser-level failure mode.</p>
+<button id="crash-button" type="button">Crash renderer</button>
+<button id="hang-button" type="button">Hang renderer 10s</button>
+<button id="close-button" type="button">Close this page</button>
+<div id="status" role="status">alive</div>
+<script>
+// chrome://crash forces a real renderer crash (Aw, Snap) when served
+// over http(s); falls back to a report-only marker otherwise.
+document.getElementById('crash-button').addEventListener('click', () => {
+  document.getElementById('status').textContent = 'crashing';
+  window.location.href = 'chrome://crash';
+});
+// Synchronous 10s busy loop: the renderer stops responding to CDP,
+// letting dispatch-timeout -> Unknown paths be exercised.
+document.getElementById('hang-button').addEventListener('click', () => {
+  document.getElementById('status').textContent = 'hanging';
+  const end = Date.now() + 10000;
+  while (Date.now() < end) { /* spin */ }
+  document.getElementById('status').textContent = 'recovered';
+});
+document.getElementById('close-button').addEventListener('click', () => {
+  document.getElementById('status').textContent = 'closing';
+  window.close();
+});
+</script>
+</body>
+</html>

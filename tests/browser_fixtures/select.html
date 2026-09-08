@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>select fixture</title>
+</head>
+<body>
+<h1 id="heading">Select fixture</h1>
+<form id="select-form" action="javascript:void(0)">
+  <label for="choice">Choose an option</label>
+  <select id="choice" name="choice">
+    <option value="">-- pick one --</option>
+    <option value="alpha">Alpha</option>
+    <option value="beta">Beta</option>
+    <option value="gamma">Gamma</option>
+  </select>
+  <button id="select-submit" type="submit">Apply</button>
+</form>
+<div id="status" role="status">nothing selected</div>
+<script>
+document.getElementById('select-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  document.getElementById('status').textContent =
+    'selected: ' + document.getElementById('choice').value;
+});
+</script>
+</body>
+</html>

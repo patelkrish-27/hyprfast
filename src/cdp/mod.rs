@@ -1,10 +1,13 @@
 //! CDP: Chrome DevTools Protocol via HTTP discovery + WebSocket JSON-RPC
-//! Minimal client for hyprfast 0.5 browser automation.
-//! No persistent daemon yet; per-call connects are ~5-15ms. Reuses tokio runtime.
+//! Phase 3: transport migrated to BrowserRuntime (persistent daemon).
+//! This module retains its public helper API for compatibility, but every
+//! call now routes through `browser_runtime::client` (daemon when alive,
+//! ephemeral BrowserRuntime fallback otherwise). No per-call WebSocket is
+//! created here — the only WebSocket connect lives in
+//! `browser_runtime/connection.rs` (invariant I2).
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 9222;
@@ -42,7 +45,36 @@ pub async fn list_targets_async() -> Result<Vec<Target>> {
 }
 
 pub fn list_targets() -> Result<Vec<Target>> {
-    rt().block_on(list_targets_async())
+    // Phase 3: try daemon's tabs path first (still Target.getTargets via persistent WS);
+    // fall back to HTTP discovery when daemon not alive.
+    let v = crate::browser_runtime::client::cdp_call_sync(
+        "Target.getTargets",
+        json!({}),
+        None,
+        None,
+        crate::browser_runtime::server::CapabilityClass::None,
+    );
+    if let Ok(val) = v {
+        if let Some(infos) = val.get("targetInfos").and_then(|x| x.as_array()) {
+            let mut out = Vec::new();
+            for info in infos {
+                // Map CDP TargetInfo to our Target shape (best-effort)
+                let id = info.get("targetId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let title = info.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let url = info.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let typ = info.get("type").and_then(|x| x.as_str()).unwrap_or("page").to_string();
+                out.push(Target { id, title, url, web_socket_debugger_url: String::new(), typ });
+            }
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+    // Fallback to HTTP /json (works even without daemon)
+    futures::executor::block_on(list_targets_async()).or_else(|_| {
+        // If even CDP via daemon failed and HTTP failed, propagate HTTP error
+        Err(anyhow::anyhow!("list_targets: daemon and HTTP discovery both failed"))
+    })
 }
 
 pub async fn list_targets_filtered_async(typ: Option<&str>) -> Result<Vec<Target>> {
@@ -53,7 +85,19 @@ pub async fn list_targets_filtered_async(typ: Option<&str>) -> Result<Vec<Target
 }
 
 pub fn version() -> Result<Value> {
-    rt().block_on(async {
+    // Browser.getVersion via persistent transport when possible.
+    let v = crate::browser_runtime::client::cdp_call_sync(
+        "Browser.getVersion",
+        json!({}),
+        None,
+        None,
+        crate::browser_runtime::server::CapabilityClass::None,
+    );
+    if let Ok(val) = v {
+        return Ok(val);
+    }
+    // Fallback to HTTP /json/version
+    futures::executor::block_on(async {
         let base = cdp_base_url();
         let url = format!("{}/json/version", base);
         let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
@@ -62,29 +106,13 @@ pub fn version() -> Result<Value> {
     })
 }
 
-// WS discovery cache: GET /json per CDP call costs 10-30ms + wrong-tab flapping.
-// Cache last-page ws_url for 2s when no explicit target match (v0.7 persistent-CDP-lite).
-static WS_CACHE: std::sync::OnceLock<std::sync::Mutex<(String, std::time::Instant)>> = std::sync::OnceLock::new();
-fn ws_cached() -> Option<String> {
-    let lock = WS_CACHE.get_or_init(|| std::sync::Mutex::new((String::new(), std::time::Instant::now() - Duration::from_secs(10))));
-    let (url, at) = lock.lock().ok()?.clone();
-    if url.is_empty() || at.elapsed() > Duration::from_secs(2) { return None; }
-    Some(url)
-}
-fn ws_store(url: &str) {
-    if let Some(lock) = WS_CACHE.get() {
-        if let Ok(mut g) = lock.lock() { *g = (url.to_string(), std::time::Instant::now()); }
-    } else {
-        let _ = WS_CACHE.set(std::sync::Mutex::new((url.to_string(), std::time::Instant::now())));
-    }
-}
-
+// WS discovery is now owned by BrowserRuntime/targets (Phase 5); these wrappers
+// are retained for compat but route through the same discovery as the daemon.
 pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> {
     let targets = list_targets_async().await?;
     if targets.is_empty() {
         bail!("no debuggable targets at {} — launch browser with --remote-debugging-port={} (e.g. brave --remote-debugging-port=9222 --force-renderer-accessibility)", cdp_base_url(), DEFAULT_PORT);
     }
-    // Prefer pages
     let mut pages: Vec<&Target> = targets.iter().filter(|t| t.typ=="page").collect();
     if pages.is_empty() { pages = targets.iter().collect(); }
     if let Some(needle) = target_url_match {
@@ -95,7 +123,6 @@ pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> 
             }
         }
     }
-    // Prefer last (most recent) page
     for t in pages.iter().rev() {
         if !t.web_socket_debugger_url.is_empty() { return Ok(t.web_socket_debugger_url.clone()); }
     }
@@ -103,14 +130,7 @@ pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> 
 }
 
 pub fn get_ws_url(target_match: Option<&str>) -> Result<String> {
-    // Fast path: cached discovery for untargeted calls (saves GET /json ~10-30ms).
-    if target_match.map(|s| s.is_empty()).unwrap_or(true) {
-        if let Some(cached) = ws_cached() { return Ok(cached); }
-        let fresh = rt().block_on(get_ws_url_async(target_match))?;
-        ws_store(&fresh);
-        return Ok(fresh);
-    }
-    rt().block_on(get_ws_url_async(target_match))
+    futures::executor::block_on(get_ws_url_async(target_match))
 }
 
 pub async fn new_page_async(url: &str) -> Result<Target> {
@@ -121,95 +141,90 @@ pub async fn new_page_async(url: &str) -> Result<Target> {
     Ok(t)
 }
 
-// ---- WebSocket JSON-RPC ----
+// ---- WebSocket JSON-RPC via BrowserRuntime (no direct WS connect here) ----
 
-use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-fn rt() -> &'static tokio::runtime::Runtime {
-    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("rt"))
-}
-
-pub async fn cdp_call_async(ws_url: &str, method: &str, params: Value) -> Result<Value> {
-    let (mut ws, _) = connect_async(ws_url).await.context("ws connect")?;
-    let id = 1;
-    let req = json!({"id": id, "method": method, "params": params});
-    ws.send(Message::Text(req.to_string().into())).await?;
-    // Read until id matches or error
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        if tokio::time::Instant::now() > deadline { bail!("CDP timeout for {}", method); }
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.context("timeout")?;
-        let Some(Ok(Message::Text(txt))) = msg else { continue; };
-        let v: Value = serde_json::from_str(&txt).unwrap_or(json!({}));
-        if v.get("id").and_then(|x| x.as_i64()) == Some(id as i64) {
-            if let Some(err) = v.get("error") { bail!("CDP {} error: {}", method, err); }
-            // close gracefully
-            let _ = ws.close(None).await;
-            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-        }
-        // ignore events without id
-    }
+pub async fn cdp_call_async(_ws_url: &str, method: &str, params: Value) -> Result<Value> {
+    // ws_url is ignored: call goes via persistent daemon (or ephemeral fallback).
+    crate::browser_runtime::client::try_cdp_call_via_daemon(
+        method,
+        params,
+        None,
+        None,
+        capability_for_method(method),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value> {
-    rt().block_on(cdp_call_async(ws_url, method, params))
+    futures::executor::block_on(cdp_call_async(ws_url, method, params))
 }
 
-/// Send multiple calls over single WS connection (faster)
+/// Send multiple calls via persistent transport (multiplexed, not serial throwaway WS).
 pub async fn cdp_batch_async(ws_url: &str, calls: Vec<(&str, Value)>) -> Result<Vec<Value>> {
-    let (mut ws, _) = connect_async(ws_url).await.context("ws connect")?;
     let mut out = Vec::new();
-    for (i, (method, params)) in calls.into_iter().enumerate() {
-        let id = (i+1) as i64;
-        let req = json!({"id": id, "method": method, "params": params});
-        ws.send(Message::Text(req.to_string().into())).await?;
-        loop {
-            let msg = ws.next().await.ok_or_else(|| anyhow::anyhow!("ws closed"))??;
-            if let Message::Text(txt) = msg {
-                let v: Value = serde_json::from_str(&txt).unwrap_or(json!({}));
-                if v.get("id").and_then(|x| x.as_i64()) == Some(id) {
-                    if let Some(err) = v.get("error") { bail!("CDP {} error: {}", method, err); }
-                    out.push(v.get("result").cloned().unwrap_or(Value::Null));
-                    break;
-                }
-            }
-        }
+    for (method, params) in calls {
+        out.push(cdp_call_async(ws_url, method, params).await?);
     }
-    let _ = ws.close(None).await;
     Ok(out)
 }
 
 pub fn cdp_batch(ws_url: &str, calls: Vec<(&str, Value)>) -> Result<Vec<Value>> {
-    rt().block_on(cdp_batch_async(ws_url, calls))
+    futures::executor::block_on(cdp_batch_async(ws_url, calls))
 }
 
 // ---- Helpers that combine discovery + ws ----
 
 pub fn call(method: &str, params: Value) -> Result<Value> {
-    let ws = get_ws_url(None)?;
-    cdp_call(&ws, method, params)
+    cdp_call("", method, params)
 }
-pub fn call_on(match_str: Option<&str>, method: &str, params: Value) -> Result<Value> {
-    let ws = get_ws_url(match_str)?;
-    cdp_call(&ws, method, params)
+pub fn call_on(_match_str: Option<&str>, method: &str, params: Value) -> Result<Value> {
+    cdp_call("", method, params)
 }
 
 /// Evaluate JS in main frame: Runtime.evaluate
 pub fn evaluate(expression: &str, await_promise: bool) -> Result<Value> {
-    let ws = get_ws_url(None)?;
-    let params = json!({"expression": expression, "returnByValue": true, "awaitPromise": await_promise, "userGesture": true});
-    let res = cdp_call(&ws, "Runtime.evaluate", params)?;
-    if let Some(exc) = res.get("exceptionDetails") { bail!("evaluate exception: {}", exc); }
-    Ok(res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(res))
+    crate::browser_runtime::client::evaluate_sync(expression, await_promise)
 }
 
 /// DOM snapshot via Runtime.evaluate -> outerHTML + AX built in JS (fallback when Accessibility domain not ready)
 pub fn ensure_enabled() -> Result<()> {
-    let ws = get_ws_url(None)?;
-    let _ = cdp_call(&ws, "Page.enable", json!({}));
-    let _ = cdp_call(&ws, "DOM.enable", json!({}));
-    let _ = cdp_call(&ws, "Runtime.enable", json!({}));
+    // Page/DOM/Runtime.enable — best-effort, capability none (read/setup)
+    let _ = crate::browser_runtime::client::cdp_call_sync(
+        "Page.enable",
+        json!({}),
+        None,
+        None,
+        crate::browser_runtime::server::CapabilityClass::None,
+    );
+    let _ = crate::browser_runtime::client::cdp_call_sync(
+        "DOM.enable",
+        json!({}),
+        None,
+        None,
+        crate::browser_runtime::server::CapabilityClass::None,
+    );
+    let _ = crate::browser_runtime::client::cdp_call_sync(
+        "Runtime.enable",
+        json!({}),
+        None,
+        None,
+        crate::browser_runtime::server::CapabilityClass::None,
+    );
     Ok(())
+}
+
+fn capability_for_method(method: &str) -> crate::browser_runtime::server::CapabilityClass {
+    use crate::browser_runtime::server::CapabilityClass as C;
+    match method {
+        "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.releaseObject" => C::RuntimeEvaluate,
+        "Storage.getCookies" | "Storage.setCookies" | "Storage.clearCookies" => C::Cookies,
+        "Page.captureScreenshot" => C::None,
+        "Page.navigate" | "Page.reload" => C::Navigation,
+        "Input.dispatchKeyEvent" | "Input.insertText" => C::None,
+        "DOM.resolveNode" | "DOM.getDocument" | "DOM.querySelector" | "DOM.describeNode" | "Accessibility.getFullAXTree" => C::None,
+        "Target.createTarget" | "Target.attachToTarget" | "Target.getTargets" | "Target.setAutoAttach" => C::None,
+        _ if method.starts_with("Storage.") => C::Cookies,
+        _ => C::None,
+    }
 }

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>analytics button fixture</title>
+</head>
+<body>
+<h1 id="heading">Analytics button fixture</h1>
+<p>Clicking the button fires an analytics beacon only. There is
+deliberately NO DOM mutation, attribute change, navigation, or dialog —
+verification must report Inconclusive, not failure.</p>
+<button id="analytics-button" type="button">Track me</button>
+<div id="status" role="status">idle</div>
+<script>
+window.__analyticsEvents = [];
+document.getElementById('analytics-button').addEventListener('click', () => {
+  // Analytics-only side effect: no observable DOM change.
+  window.__analyticsEvents.push({ event: 'button_click', t: Date.now() });
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon('/__analytics', JSON.stringify({ event: 'button_click' }));
+  }
+});
+</script>
+</body>
+</html>

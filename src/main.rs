@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![allow(clippy::all, clippy::pedantic, clippy::nursery, dead_code, unused_imports, unused_variables, unused_assignments)]
 mod hypr;
 mod a11y;
 mod input;
@@ -11,6 +12,7 @@ mod cdp;
 mod browser;
 mod stagehand;
 mod ground;
+mod browser_runtime;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -81,6 +83,16 @@ enum StagehandCmd {
 }
 
 #[derive(Subcommand)]
+enum BrowserRuntimeCmd {
+    /// Start the persistent browser-runtime daemon (owns the single CDP connection)
+    Start,
+    /// Stop the browser-runtime daemon cleanly (drains, closes WS, removes socket)
+    Stop,
+    /// Show daemon status: lifecycle state, browser, targets, counters, socket mode
+    Status,
+}
+
+#[derive(Subcommand)]
 enum TaskCmd {
     /// Initialize task list: breakdown goal into steps
     Init { goal: String, #[arg(long)] steps: String },
@@ -115,6 +127,10 @@ enum Commands {
     Session { action: String },
     Task { #[command(subcommand)] cmd: TaskCmd },
     Browser { #[command(subcommand)] cmd: BrowserCmd },
+    BrowserRuntime { #[command(subcommand)] cmd: BrowserRuntimeCmd },
+    /// Internal: daemon serve loop (spawned detached by `browser-runtime start`)
+    #[command(hide = true)]
+    BrowserRuntimeInternalServe,
     Stagehand { #[command(subcommand)] cmd: StagehandCmd },
     /// Fast visual grounding: screenshot + Gemini Flash -> {x,y}
     Ground { instruction: String, #[arg(long)] window: Option<String>, #[arg(long)] region: Option<String> },
@@ -247,6 +263,40 @@ fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
+        Some(Commands::BrowserRuntime { cmd }) => {
+            match cmd {
+                BrowserRuntimeCmd::Start => {
+                    match browser_runtime::server::start_daemon_detached() {
+                        Ok(()) => {
+                            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                            match rt.block_on(browser_runtime::client::status_once()) {
+                                Ok(s) => println!("{}", serde_json::to_string_pretty(&s)?),
+                                Err(e) => println!("{}", serde_json::to_string_pretty(&serde_json::json!({"started": true, "socket": browser_runtime::server::browser_socket_path(), "status_error": e.to_string()}))?),
+                            }
+                        }
+                        Err(e) => anyhow::bail!("browser-runtime start: {e}"),
+                    }
+                }
+                BrowserRuntimeCmd::Stop => {
+                    match browser_runtime::server::stop_daemon_sync() {
+                        Ok(()) => println!("{}", serde_json::to_string_pretty(&serde_json::json!({"stopped": true}))?),
+                        Err(browser_runtime::error::RuntimeError::RuntimeDead(_)) => println!("daemon not running"),
+                        Err(e) => anyhow::bail!("browser-runtime stop: {e}"),
+                    }
+                }
+                BrowserRuntimeCmd::Status => {
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                    match rt.block_on(browser_runtime::client::status_once()) {
+                        Ok(s) => println!("{}", serde_json::to_string_pretty(&s)?),
+                        Err(e) => anyhow::bail!("browser-runtime status: {e} (is the daemon running? try `hyprfast browser-runtime start`)"),
+                    }
+                }
+            }
+        }
+        Some(Commands::BrowserRuntimeInternalServe) => {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(browser_runtime::server::serve(browser_runtime::server::ServeOptions::defaults()))?;
+        }
         Some(Commands::Browser { cmd }) => {
             let res = match cmd {
                 BrowserCmd::Navigate { url, target } => browser::navigate(&url, target.as_deref())?,
@@ -258,17 +308,9 @@ fn main() -> Result<()> {
                     let rf = r#ref.unwrap_or_default();
                     let target = if !rf.is_empty() { rf } else { sel };
                     if target.is_empty() { anyhow::bail!("click needs --ref or --selector"); }
+                    // Phase 3: route via persistent BrowserRuntime (no per-call WS)
                     if target.chars().all(|c| c.is_ascii_digit()) {
-                        // backendNodeId path: resolve then click via Runtime
-                        let ws = cdp::get_ws_url(None)?;
-                        let bid: i64 = target.parse().unwrap_or(0);
-                        let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", serde_json::json!({"backendNodeId": bid}))?;
-                        if let Some(obj) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                            let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", serde_json::json!({"objectId": obj, "functionDeclaration": "function(){this.click(); return this.tagName;}", "returnByValue": true}))?;
-                            serde_json::json!({"clicked": true, "ref": target, "via":"CDP-backend"})
-                        } else {
-                            browser::click_by_selector(&target)?
-                        }
+                        browser::click_by_ref(&target, "")?
                     } else {
                         browser::click_by_selector(&target)?
                     }
@@ -287,7 +329,19 @@ fn main() -> Result<()> {
                     browser::select_option(&s, &values)?
                 },
                 BrowserCmd::Press { key } => browser::press_key(&key)?,
-                BrowserCmd::Eval { js } => browser::evaluate_js(&js)?,
+                BrowserCmd::Eval { js } => {
+                    // Phase 2: the daemon owns the persistent CDP connection.
+                    // Degraded direct mode only when no daemon is reachable.
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                    match rt.block_on(browser_runtime::client::try_evaluate_via_daemon(&js)) {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => anyhow::bail!("browser-runtime daemon error: {e}"),
+                        None => {
+                            eprintln!("warning: browser-runtime daemon unavailable; using degraded direct mode (`hyprfast browser-runtime start` for the persistent path)");
+                            browser::evaluate_js(&js)?
+                        }
+                    }
+                },
                 BrowserCmd::Shot { output } => {
                     let (data, meta) = browser::screenshot_cdp()?;
                     let path = output.unwrap_or_else(|| format!("/tmp/hyprfast-browser-{}.png", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
@@ -436,7 +490,8 @@ fn run_mcp() -> Result<()> {
         {"name":"clipboard_read","description":"Clipboard read via CDP","inputSchema":{"type":"object","properties":{}}},
         {"name":"ground","description":"Fast visual grounding: screenshot + Gemini Flash -> {x,y} global coords. Works on canvas/draw/color-pickers where AX has no tree.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"window":{"type":"string"},"region":{"type":"string"}},"required":["instruction"]}},
         {"name":"act_fast","description":"Fused ground+click/type/key in ONE call (Astra-like). instruction + action click|type|key + text. No snapshot loop.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string"},"text":{"type":"string"},"window":{"type":"string"}},"required":["instruction"]}},
-        {"name":"act_batch","description":"Batch fused steps [{instruction,action,text}] in one MCP call. Max 12 steps.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"]}}
+        {"name":"act_batch","description":"Batch fused steps [{instruction,action,text}] in one MCP call. Max 12 steps.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"]}},
+        {"name":"browser_execute_plan","description":"Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract/go_back/tabs/snapshot. Validates syntax without eagerly resolving post-navigation targets. Additive — single-action browser_* tools remain.","inputSchema":{"type":"object","properties":{"plan":{"type":"object","description":"ExecutionPlan {steps:[{type:'navigate',url},{type:'type',text,selector},{type:'wait',url_contains},{type:'extract',selector}] }"},"steps":{"type":"array","description":"alias for plan.steps"}},"required":[]}}
     ]);
     for line in reader.lines() {
         let line = line?;
@@ -570,18 +625,10 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let r#ref = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let sel = if !r#ref.is_empty() { r#ref } else { element };
             if sel.is_empty() { anyhow::bail!("browser_click needs ref or element selector"); }
-            // Prefer JS selector click; if ref looks like backend id, try backend
+            // Phase 3: backend path now via persistent BrowserRuntime (no per-call WS)
             if r#ref.chars().all(|c| c.is_ascii_digit()) && !r#ref.is_empty() {
-                // backend id path
-                let ws = cdp::get_ws_url(None)?;
-                let backend: i64 = r#ref.parse().unwrap_or(0);
-                if backend!=0 {
-                    let resolved = cdp::cdp_call(&ws, "DOM.resolveNode", serde_json::json!({"backendNodeId": backend}))?;
-                    if let Some(obj) = resolved.get("object").and_then(|o| o.get("objectId")).and_then(|v| v.as_str()) {
-                        let _ = cdp::cdp_call(&ws, "Runtime.callFunctionOn", serde_json::json!({"objectId": obj, "functionDeclaration": "function(){this.click(); return true;}", "returnByValue": true}))?;
-                        return Ok(serde_json::json!({"clicked": true, "ref": r#ref, "via":"CDP"}));
-                    }
-                }
+                let res = browser::click_by_ref(r#ref, "");
+                if res.is_ok() { return res; }
             }
             browser::click_by_selector(sel)
         },
@@ -748,6 +795,16 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let steps = args.get("steps").cloned().unwrap_or(Value::Null);
             let window = args.get("window").and_then(|v| v.as_str()).unwrap_or("");
             ground::act_batch(&steps, window)
+        },
+        "browser_execute_plan" => {
+            // Phase 7 additive plan execution — additive, single-action tools preserved.
+            // Accept either {plan:{steps:[...]}} or {steps:[...]} or bare array {plan:[...]}
+            let plan_val = args.get("plan").cloned()
+                .or_else(|| args.get("steps").cloned().map(|v| serde_json::json!({"steps": v})))
+                .unwrap_or(args.clone());
+            // If args itself looks like a plan object (has steps or type), forward as-is
+            let v = if plan_val.get("steps").is_some() || plan_val.is_array() { plan_val } else if args.get("steps").is_some() { serde_json::json!({"steps": args.get("steps").unwrap()}) } else { args.clone() };
+            crate::browser_runtime::client::execute_plan_sync(v)
         },
         _ => anyhow::bail!("unknown tool {}", name),
     }

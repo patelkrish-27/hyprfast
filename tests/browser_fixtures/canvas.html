@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Canvas Test</title>
+    <style>
+        body { margin: 0; padding: 20px; font-family: sans-serif; }
+        canvas { border: 1px solid black; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Canvas UI</h1>
+    <p>This button is drawn on a canvas. The DOM knows nothing about it.</p>
+    <canvas id="myCanvas" width="400" height="200"></canvas>
+    <div id="output"></div>
+    <script>
+        const canvas = document.getElementById('myCanvas');
+        const ctx = canvas.getContext('2d');
+        const output = document.getElementById('output');
+
+        // Draw a button
+        ctx.fillStyle = '#007bff';
+        ctx.fillRect(100, 75, 200, 50);
+        ctx.fillStyle = 'white';
+        ctx.font = '20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('Canvas Button', 200, 100);
+
+        // Handle click
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            if (x >= 100 && x <= 300 && y >= 75 && y <= 125) {
+                output.textContent = 'Canvas button clicked!';
+                output.className = 'clicked';
+            }
+        });
+    </script>
+</body>
+</html>

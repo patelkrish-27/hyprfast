@@ -1,32 +1,29 @@
 //! Hybrid snapshot — port of packages/extension/understudy/a11y/snapshot/capture.ts
-//! Simplified for hyprfast: uses CDP Accessibility.getFullAXTree + DOM.getDocument
-//! Hybrid = AX tree trimmed + xpath map + frame ordinals (stagehand encodes as "0-1234")
-//! Hyprfast already has browser::snapshot() via cdp; this upgrades it to stagehand fidelity
+//! Phase 3: transport via BrowserRuntimeClient (capability none, read-only).
+//! B4 deferred: fabricated encIds in fallback — preserved here, fixed in Phase 6.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
-use crate::cdp;
+use crate::browser_runtime::server::CapabilityClass;
+use crate::browser_runtime::client as rt_client;
 
 /// Stagehand HybridSnapshot shape (subset)
 #[derive(Debug, Clone)]
 pub struct HybridSnapshot {
-    pub combined_tree: String, // textual tree with [frame-backendId] markers
-    pub combined_xpath_map: Value, // encId -> xpath
+    pub combined_tree: String,
+    pub combined_xpath_map: Value,
     pub combined_url_map: Value,
     pub raw_ax_nodes: usize,
     pub via: String,
 }
 
-/// Capture hybrid snapshot using CDP Accessibility + optional frame walk
-/// Mirrors captureHybridSnapshot() fast-path
 pub fn capture_hybrid() -> Result<HybridSnapshot> {
-    let ws = cdp::get_ws_url(None)?;
-    // Ensure domains
-    let _ = cdp::cdp_call(&ws, "DOM.enable", json!({}));
-    let _ = cdp::cdp_call(&ws, "Accessibility.enable", json!({}));
+    // Ensure domains via persistent transport — capability none
+    let _ = rt_client::cdp_call_sync("DOM.enable", json!({}), None, None, CapabilityClass::None);
+    let _ = rt_client::cdp_call_sync("Accessibility.enable", json!({}), None, None, CapabilityClass::None);
 
-    // 1. Try Accessibility.getFullAXTree (stagehand primary)
-    let ax_res = cdp::cdp_call(&ws, "Accessibility.getFullAXTree", json!({}));
+    // 1. Try Accessibility.getFullAXTree
+    let ax_res = rt_client::cdp_call_sync("Accessibility.getFullAXTree", json!({}), None, None, CapabilityClass::None);
     if let Ok(val) = ax_res {
         if let Some(nodes) = val.get("nodes").and_then(|v| v.as_array()) {
             if !nodes.is_empty() {
@@ -43,8 +40,8 @@ pub fn capture_hybrid() -> Result<HybridSnapshot> {
             }
         }
     }
-    // 2. Fallback: JS hybrid tree builder (mirrors stagehand treeFormatUtils)
-    let js_tree = snapshot_via_js(&ws)?;
+    // 2. Fallback: JS hybrid tree builder
+    let js_tree = snapshot_via_js()?;
     Ok(HybridSnapshot {
         combined_tree: js_tree.get("tree").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         combined_xpath_map: js_tree.get("xpathMap").cloned().unwrap_or(json!({})),
@@ -55,8 +52,6 @@ pub fn capture_hybrid() -> Result<HybridSnapshot> {
 }
 
 fn build_tree_from_ax(nodes: &[Value], frame_ordinal: i32) -> (String, Value) {
-    // Stagehand encodes as "[frameOrdinal-backendId]" + role + name + xpath
-    // Do similar to browser/mod.rs build_snapshot_from_ax but with tree string
     let mut lines = Vec::new();
     let mut xpath_map = serde_json::Map::new();
     for n in nodes.iter().take(300) {
@@ -67,33 +62,29 @@ fn build_tree_from_ax(nodes: &[Value], frame_ordinal: i32) -> (String, Value) {
         let backend = n.get("backendDOMNodeId").and_then(|v| v.as_i64()).unwrap_or(0);
         if backend==0 && name.is_empty() && role.is_empty() { continue; }
         let node_id = n.get("nodeId").and_then(|v| v.as_str()).unwrap_or("");
-        // Build id like Stagehand
         let enc = format!("{}-{}", frame_ordinal, backend);
         let xpath = n.get("properties").and_then(|p| p.as_array())
             .and_then(|arr| arr.iter().find(|x| x.get("name").and_then(|v| v.as_str())==Some("xpath")))
             .and_then(|x| x.get("value").and_then(|v| v.get("value")).and_then(|v| v.as_str()))
             .unwrap_or("").to_string();
         if !xpath.is_empty() { xpath_map.insert(enc.clone(), Value::String(xpath)); }
-        // Depth heuristic from childIds? Stagehand uses outline with indent — do flat with markers
         let line = format!("[{}] {} '{}' {}", enc, role, name.chars().take(120).collect::<String>(), node_id);
         lines.push(line);
         if lines.len()>=150 { break; }
     }
-    // Trim for token efficiency — stagehand does hybrid trimming to ~8192 tokens
     let tree = trim_tree(&lines.join("\n"), 8000);
     (tree, Value::Object(xpath_map))
 }
 
 fn trim_tree(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars { return s.to_string(); }
-    // Stagehand trims keep top + bottom, prioritize interactive — simple truncate
     let mut out = s.chars().take(max_chars).collect::<String>();
     out.push_str("\n...[trimmed for token efficiency - Stagehand hybrid trimming]...");
     out
 }
 
-fn snapshot_via_js(ws: &str) -> Result<Value> {
-    // Mirrors stagehand's injected script but simpler — produce tree + xpathMap
+fn snapshot_via_js() -> Result<Value> {
+    // B4 deferred: fabricated encIds "0-"+(10000+count) — preserved
     let js = r#"
 (() => {
   const MAX = 200;
@@ -121,7 +112,6 @@ fn snapshot_via_js(ws: &str) -> Result<Value> {
     const rect=el.getBoundingClientRect();
     const visible=rect.width>0 && rect.height>0 && getComputedStyle(el).visibility!=='hidden';
     if(visible || name){
-      // approximate backendId via count (stagehand uses CDP backendNodeId; we fake ordinal 0)
       const enc = "0-"+(10000+count);
       const xpath = getXpath(el);
       xpathMap[enc]=xpath;
@@ -134,12 +124,12 @@ fn snapshot_via_js(ws: &str) -> Result<Value> {
 })()
 "#;
     let params = json!({"expression": js, "returnByValue": true, "awaitPromise": false});
-    let res = cdp::cdp_call(ws, "Runtime.evaluate", params)?;
+    // capability none (read)
+    let res = rt_client::cdp_call_sync("Runtime.evaluate", params, None, None, CapabilityClass::None)?;
     let val = res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(Value::Null);
     Ok(val)
 }
 
-/// For actHandlerUtils — resolve encId -> backend
 pub fn parse_enc_id(enc: &str) -> Option<(i32,i64)> {
     let mut sp = enc.splitn(2, '-');
     let ord: i32 = sp.next()?.parse().ok()?;
@@ -147,9 +137,7 @@ pub fn parse_enc_id(enc: &str) -> Option<(i32,i64)> {
     Some((ord, backend))
 }
 
-/// Diff helper for two-step dropdown detection
 pub fn diff_trees(a: &str, b: &str) -> String {
-    // Simple: return added lines — stagehand uses diffCombinedTrees
     let set_a: std::collections::HashSet<&str> = a.lines().collect();
     let added: Vec<&str> = b.lines().filter(|l| !set_a.contains(l)).collect();
     if added.is_empty() { b.to_string() } else { added.join("\n") }
