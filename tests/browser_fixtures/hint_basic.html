@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hint_basic fixture</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  #status { margin-top: 12px; border: 1px solid #ccc; padding: 6px; min-height: 20px; }
+  .row { margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1 id="heading">hint_basic fixture</h1>
+<p>Deterministic hint labels for hyprfast hint_snapshot tests.</p>
+<div class="row">
+  <button id="btn-a" onclick="document.getElementById('status').textContent='clicked-a'">Button A</button>
+  <button id="btn-b" onclick="document.getElementById('status').textContent='clicked-b'">Button B</button>
+  <a id="link-c" href="#" onclick="document.getElementById('status').textContent='clicked-c'; return false;">Link C</a>
+  <input id="input-d" type="text" placeholder="type here">
+  <select id="select-e"><option>alpha</option><option>beta</option></select>
+  <textarea id="ta-f" placeholder="textarea"></textarea>
+</div>
+<div class="row">
+  <div id="role-btn" role="button" tabindex="0" onclick="document.getElementById('status').textContent='clicked-role'">Role Button</div>
+  <div id="onclick-div" onclick="document.getElementById('status').textContent='clicked-onclick'">OnClick Div</div>
+  <div id="editable" contenteditable="true" style="border:1px solid #999; padding:4px; min-height:20px;">editable</div>
+  <summary id="summary-g">Summary G</summary>
+  <div id="tabbable" tabindex="0" onclick="document.getElementById('status').textContent='clicked-tab'">Tabbable</div>
+  <div id="hidden-btn" style="display:none">Hidden</div>
+</div>
+<div id="status" role="status">idle</div>
+<script>
+  // expose helper for tests
+  window.__hintTest = {
+    status: () => document.getElementById('status').textContent,
+    setStatus: (s) => document.getElementById('status').textContent = s
+  };
+</script>
+</body>
+</html>

@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "hyprfast"
-version = "0.7.1"
+version = "0.9.0-dev"
 dependencies = [
  "anyhow",
  "base64",
@@ -741,6 +741,7 @@ dependencies = [
  "clap",
  "futures",
  "nix",
+ "once_cell",
  "regex",
  "reqwest",
  "rmcp",

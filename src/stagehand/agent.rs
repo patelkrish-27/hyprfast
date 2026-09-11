@@ -34,17 +34,33 @@ pub fn execute(goal: &str, cfg: &StagehandConfig, max_steps: usize) -> Result<Va
             "close" => { done = true; json!({"closed": true, "reason": instruction}) },
             _ => crate::stagehand::act::act(&instruction, cfg).unwrap_or(json!({"error": "act fallback failed"})),
         };
-        let entry = json!({"step": step+1, "tool": tool, "instruction": instruction, "result": step_result, "llm": llm_resp});
+        // Tier distribution tracking — act/observe results carry tier field (a11y/hint/vision)
+        let tier = step_result.get("tier").and_then(|v| v.as_str()).unwrap_or_else(|| {
+            if step_result.get("hintLabel").is_some() { "hint" } else if step_result.get("vision").and_then(|v| v.as_bool()).unwrap_or(false) { "vision" } else { "a11y" }
+        }).to_string();
+        // Record tier in stagehand_metrics but don't double-count: act/observe already recorded inside their own handlers.
+        // Here we just log per-step tier for agent visibility.
+        eprintln!("[stagehand agent] step {} tool={} tier={} instruction={:?}", step+1, tool, tier, instruction);
+        let entry = json!({"step": step+1, "tool": tool, "instruction": instruction, "result": step_result, "tier": tier, "llm": llm_resp});
         steps.push(entry.clone());
         if done || tool=="close" { break; }
         // Check if LLM signaled completion via raw content containing "close"
         if llm_resp.to_string().to_lowercase().contains("\"close\"") || llm_resp.get("close").and_then(|v| v.as_bool()).unwrap_or(false) { break; }
     }
 
+    // Tier distribution summary for metrics visibility
+    let mut dist = std::collections::HashMap::new();
+    for s in &steps {
+        let t = s.get("tier").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        *dist.entry(t).or_insert(0usize) += 1;
+    }
+    let metrics_snap = crate::stagehand::instrumentation::METRICS.snapshot();
     Ok(json!({
         "goal": goal,
         "steps": steps,
         "completed": done,
-        "total_steps": steps.len()
+        "total_steps": steps.len(),
+        "tierDistribution": dist,
+        "metrics": metrics_snap
     }))
 }

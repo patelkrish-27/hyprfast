@@ -1,5 +1,8 @@
 //! observe — port of packages/extension/services? / observeHandler
 //! Returns Action[] matching instruction using LLM
+//! Tier 2 (Milestone 3): if LLM yields no elements, fallback to hint_snapshot
+//! Tier 3: vision not meaningful for observe (returns hint elements instead)
+//! Vimium-primary: hint_snapshot is primary enumeration source when AX tree trimmed/small; keep AX first, hint fallback preserves coverage.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -34,7 +37,91 @@ pub fn observe(instruction: Option<&str>, cfg: &StagehandConfig) -> Result<Value
         crate::stagehand::instrumentation::METRICS.add("observe", &resp);
     }
     let resp = raw_last;
-    let elements = Value::Array(all_elements.clone());
+    let mut elements = Value::Array(all_elements.clone());
+    let mut tier = "a11y".to_string();
+    let mut hint_used = false;
+
+    // Tier 2: if a11y/LLM produced no elements, fall back to hint overlay (DOM scan)
+    // Vimium-primary enumeration: hint_snapshot is preferred when AX tree trimmed/small (needs_hint covers that); vision last resort kept inside hint_act for act path.
+    let needs_hint = match elements.as_array() {
+        Some(arr) => arr.is_empty(),
+        None => true,
+    };
+    if needs_hint {
+        if let Ok(hints_val) = crate::hint::hint_snapshot() {
+            let hints_arr = hints_val.get("hints").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if !hints_arr.is_empty() {
+                // Filter hints to instruction if not generic "find all"
+                let generic = instr.to_lowercase().contains("all actionable") || instr.to_lowercase().contains("find all");
+                let filtered: Vec<Value> = if generic {
+                    hints_arr.clone()
+                } else {
+                    // Try heuristic single match, else ask LLM to rank, else return all
+                    // Use hint resolver to pick relevant labels
+                    let mut matching_labels: Vec<String> = Vec::new();
+                    // heuristic: gather candidates containing target substring
+                    let target_low = instr.to_lowercase();
+                    let tokens: Vec<String> = target_low.split_whitespace()
+                        .filter(|w| !["find","all","the","a","an","please","click","type","press"].contains(w))
+                        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    for h in &hints_arr {
+                        let label = h.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let text = h.get("text").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let role = h.get("role").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        if tokens.iter().any(|tok| name.contains(tok) || text.contains(tok) || role.contains(tok)) {
+                            matching_labels.push(label.to_string());
+                        }
+                    }
+                    if !matching_labels.is_empty() && matching_labels.len() <= 5 {
+                        hints_arr.into_iter().filter(|h| {
+                            h.get("label").and_then(|v| v.as_str()).map(|l| matching_labels.contains(&l.to_string())).unwrap_or(false)
+                        }).collect()
+                    } else if let Ok(Some(label)) = crate::hint::llm_hint_match(instr, &hints_val, cfg) {
+                        hints_arr.into_iter().filter(|h| h.get("label").and_then(|v| v.as_str()) == Some(label.as_str())).collect()
+                    } else {
+                        // fallback: return all if no LLM filtering succeeded and not generic
+                        // To avoid returning 60 elements for a specific query, return all if filtering found none — caller can see hint distribution
+                        hints_arr.into_iter().take(20).collect()
+                    }
+                };
+                // Convert hint entries to observe-style elements
+                let hint_elements: Vec<Value> = filtered.into_iter().map(|h| {
+                    let label = h.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                    let tag = h.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+                    let role = h.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let selector = h.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+                    let method = if ["input","textarea","select"].contains(&tag) { "type" } else { "click" };
+                    json!({
+                        "elementId": format!("hint-{}", label),
+                        "description": name,
+                        "method": method,
+                        "arguments": [],
+                        "selector": selector,
+                        "role": role,
+                        "tag": tag,
+                        "label": label,
+                        "via": "hint",
+                        "hint": h
+                    })
+                }).collect();
+                if !hint_elements.is_empty() {
+                    elements = Value::Array(hint_elements);
+                    tier = "hint".to_string();
+                    hint_used = true;
+                    crate::stagehand::instrumentation::METRICS.record_tier("hint");
+                }
+            }
+        }
+    }
+    if tier == "a11y" && !needs_hint {
+        // we had a11y elements — record tier
+        // Only count successful a11y observe when we didn't fallback
+        crate::stagehand::instrumentation::METRICS.record_tier("a11y");
+    }
 
     // Normalize to Action shape and enrich with xpath if available
     let xpath_map = &snap.combined_xpath_map;
@@ -42,6 +129,7 @@ pub fn observe(instruction: Option<&str>, cfg: &StagehandConfig) -> Result<Value
         let mut out = Vec::new();
         for el in arr {
             let mut e = el.clone();
+            // already hint elements have selector/label — keep them
             if let Some(enc) = el.get("elementId").and_then(|v| v.as_str()) {
                 if let Some(xpath) = xpath_map.get(enc).cloned().or_else(|| xpath_map.get(&enc.to_string()).cloned()) {
                     e["xpath"] = xpath;
@@ -57,7 +145,9 @@ pub fn observe(instruction: Option<&str>, cfg: &StagehandConfig) -> Result<Value
     Ok(json!({
         "data": enriched,
         "snapshot": snap.combined_tree.chars().take(2000).collect::<String>(),
-        "via": snap.via,
+        "via": if hint_used { Value::String("hint".into()) } else { Value::String(snap.via.clone()) },
+        "tier": tier,
+        "hintUsed": hint_used,
         "raw": resp
     }))
 }

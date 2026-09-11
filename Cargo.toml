@@ -1,8 +1,8 @@
 [package]
 name = "hyprfast"
-version = "0.7.1"
+version = "0.9.0-dev"
 edition = "2021"
-description = "Fast hypruse alternative: persistent Hyprland IPC + direct AT-SPI + CDP browser automation, MCP + CLI"
+description = "Fast hypruse alternative: persistent Hyprland IPC + direct AT-SPI + CDP browser automation + Excalidraw lightning, MCP + CLI"
 license = "MIT"
 
 [[bin]]
@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+once_cell = "1"
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "0.6", features = ["server", "transport-io"] }
 schemars = "0.8"

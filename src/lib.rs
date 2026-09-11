@@ -5,3 +5,4 @@
 //! link against this crate target. Phase 1 exposes only `browser_runtime`;
 //! later phases add their modules here as they land.
 pub mod browser_runtime;
+pub mod devtools_mcp;

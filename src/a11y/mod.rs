@@ -66,12 +66,29 @@ except Exception as e:
 }
 
 pub fn click_by_name(window: &str, name: &str) -> Result<Value> {
-    if let Ok(v) = zbus_impl::click_by_name_zbus_sync(window, name) {
+    if let Ok(mut v) = zbus_impl::click_by_name_zbus_sync(window, name) {
+        // Ensure tier is visible for metrics distribution
+        if v.is_object() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("tier".into(), Value::String("a11y".into()));
+            }
+        }
+        crate::stagehand::instrumentation::METRICS.record_tier("a11y");
         return Ok(v);
     }
     let els = list_elements(window, name)?;
     let arr = els.get("elements").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     if arr.is_empty() {
+        // 1. a11y found nothing — 2. try hint-key middle tier before falling back to vision pointer
+        let hint_attempt = (|| -> Result<Value> {
+            let cfg = crate::stagehand::StagehandConfig::from_env();
+            let (res, label) = crate::hint::try_hint_tier(name, "click", "", &cfg)?;
+            crate::stagehand::instrumentation::METRICS.record_tier("hint");
+            Ok(serde_json::json!({"clicked": true, "via": "hint", "label": label, "tier": "hint", "result": res}))
+        })();
+        if let Ok(v) = hint_attempt {
+            return Ok(v);
+        }
         if let Some(note)=els.get("note").and_then(|v| v.as_str()) { bail!("{}", note); }
         bail!("no elements matching {:?}", name);
     }
@@ -84,7 +101,6 @@ pub fn click_by_name(window: &str, name: &str) -> Result<Value> {
     let target = pool[0];
     let x = target.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
     let y = target.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as f64;
-    // Focus window then click via hypruse DoAction or pointer (fallback)
     let win = window.to_string();
     let code = format!(r#"
 import json
@@ -115,5 +131,30 @@ print(json.dumps({{"clicked": True, "x": {x}, "y": {y}, "via": "DoAction" if cli
 "#, win=win.replace('"',r#"\""#), name_py=format!("{:?}", name), x=x, y=y);
     let out = Command::new("python3").args(["-c", &code]).output()?;
     if !out.status.success() { bail!("click failed: {}", String::from_utf8_lossy(&out.stderr)); }
-    Ok(serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?)
+    let mut v: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
+    let via = v.get("via").and_then(|x| x.as_str()).unwrap_or("");
+    if via == "DoAction" {
+        crate::stagehand::instrumentation::METRICS.record_tier("a11y");
+        if v.is_object() {
+            if let Some(obj) = v.as_object_mut() { obj.insert("tier".into(), Value::String("a11y".into())); }
+        }
+        return Ok(v);
+    }
+    // DoAction failed -> fell back to pointer (2nd tier would be hint before vision)
+    // Try hint middle tier before returning pointer vision fallback
+    let hint_attempt = (|| -> Result<Value> {
+        let cfg = crate::stagehand::StagehandConfig::from_env();
+        let (res, label) = crate::hint::try_hint_tier(name, "click", "", &cfg)?;
+        crate::stagehand::instrumentation::METRICS.record_tier("hint");
+        Ok(serde_json::json!({"clicked": true, "via": "hint", "label": label, "tier": "hint", "result": res, "fallback_from": v}))
+    })();
+    if let Ok(hv) = hint_attempt {
+        return Ok(hv);
+    }
+    // hint also failed -> pointer was already the vision-ish fallback; record as vision for distribution
+    crate::stagehand::instrumentation::METRICS.record_tier("vision");
+    if v.is_object() {
+        if let Some(obj) = v.as_object_mut() { obj.insert("tier".into(), Value::String("vision".into())); }
+    }
+    Ok(v)
 }

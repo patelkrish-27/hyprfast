@@ -1,6 +1,7 @@
 //! act — port of packages/extension/services/actService.ts
 //! Phase 3: transport migrated to BrowserRuntimeClient (capability-tagged).
 //! Resolution bugs (B2/B5/B14 etc.) preserved — fixed in Phase 6.
+//! Vimium-primary: hint_act fast path before AX snapshot; AX -> hint -> vision fallback preserved, vision last resort.
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -8,6 +9,7 @@ use crate::stagehand::{prompt, llm, snapshot, cache, StagehandConfig};
 use crate::browser_runtime::server::CapabilityClass;
 use crate::browser_runtime::client as rt_client;
 use crate::browser;
+use crate::hint;
 
 const SUPPORTED_ACTIONS: &[&str] = &["click","fill","type","press","selectOptionFromDropdown","scrollIntoView","hover","waitForSelector","scroll","dragAndDrop","nextChunk","prevChunk"];
 
@@ -201,6 +203,22 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
         }
     }
 
+    // Vimium-primary fast path: try hint_act first (single snapshot, no AX) if enabled
+    // Use heuristic -> LLM batch inside hint_act; if hint_act succeeds return immediately.
+    // Only fall through to AX snapshot path if hint_act fails (no label or dispatch error)
+    // Keep vision fallback inside hint_act itself when hint count==0.
+    {
+        let m = if instruction.to_lowercase().contains("type") || instruction.to_lowercase().contains("fill") { "type" } else { "click" };
+        match crate::hint::hint_act(instruction, m, "", cfg) {
+            Ok(v) if v.get("success").and_then(|x| x.as_bool()).unwrap_or(false) => {
+                crate::stagehand::instrumentation::METRICS.record_tier("hint");
+                return Ok(json!({"success":true,"tier":"hint","hint_primary":true,"hintLabel":v.get("label").cloned().unwrap_or(Value::Null),"via":"hint_act","actionDescription":instruction,"result":v}));
+            }
+            Ok(v) => eprintln!("[stagehand act] hint_primary non-success fall through to AX: {}", v),
+            Err(e) => eprintln!("[stagehand act] hint_primary failed fall through to AX: {}", e),
+        }
+    }
+
     let snap = snapshot::capture_hybrid()?;
     let supported = supported_list();
     let system = prompt::build_act_system_prompt(cfg.system_prompt.as_deref());
@@ -217,32 +235,96 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
     crate::stagehand::instrumentation::METRICS.add("act", &llm_resp);
     let _elapsed = t0.elapsed().as_millis() as u32;
     let action_obj = llm_resp.get("action").or_else(|| llm_resp.get("element")).or_else(|| llm_resp.get("actions").and_then(|a| a.get(0))).cloned().unwrap_or(Value::Null);
-    if action_obj.is_null() || action_obj.get("method").is_none() && action_obj.get("elementId").is_none() {
-        if llm_resp.get("action").and_then(|v| v.as_null()).is_some() || llm_resp.to_string().contains("null") {
-            return Ok(json!({"success": false, "message": "No action found", "actionDescription": instruction, "actions": [], "llm": llm_resp}));
+    // tier tracking: a11y -> hint -> vision
+    let mut tier = "a11y".to_string();
+    let mut hint_label: Option<String> = None;
+    let mut vision_used = false;
+
+    // Helper to attempt hint then vision fallback for a given method/text
+    let try_hint_vision_fallback = |instr: &str, method: &str, type_text: &str, tier_ref: &mut String, label_ref: &mut Option<String>, vision_ref: &mut bool| -> Option<Value> {
+        // 2. hint tier
+        match hint::try_hint_tier(instr, method, type_text, cfg) {
+            Ok((v, label)) => {
+                *tier_ref = "hint".to_string();
+                *label_ref = Some(label);
+                crate::stagehand::instrumentation::METRICS.record_tier("hint");
+                return Some(v);
+            },
+            Err(e) => {
+                eprintln!("[stagehand act] hint tier failed: {}", e);
+            }
         }
+        // 3. vision tier (last resort)
+        match hint::try_vision_tier(instr, method, type_text, "") {
+            Ok(v) => {
+                *tier_ref = "vision".to_string();
+                *vision_ref = true;
+                crate::stagehand::instrumentation::METRICS.record_tier("vision");
+                // also record browser_runtime vision_fallback if server available
+                return Some(v);
+            },
+            Err(e) => {
+                eprintln!("[stagehand act] vision tier failed: {}", e);
+            }
+        }
+        None
+    };
+
+    if action_obj.is_null() || action_obj.get("method").is_none() && action_obj.get("elementId").is_none() {
+        // Check if LLM explicitly says no action vs just malformed — still try fallback tiers before failing
+        let is_explicit_null = llm_resp.get("action").and_then(|v| v.as_null()).is_some() || llm_resp.to_string().contains("\"action\": null") || llm_resp.to_string().contains("\"action\":null");
+        // If LLM gave elementId directly, handle via a11y path first
         if llm_resp.get("elementId").is_some() {
             let mut res = execute_action(&llm_resp, None);
-            if res.is_err() {
-                let err_str = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-                if err_str.contains("Could not find object") || err_str.contains("not found") {
-                    let elem_id = llm_resp.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
-                    let name = find_name_for_id(&snap.combined_tree, elem_id).unwrap_or_else(|| extract_target_from_instruction(instruction));
-                    if !name.is_empty() {
-                        let js = format!("(() => {{ const els=[...document.querySelectorAll('button, [role=\"button\"], a, div, span')]; const t=els.find(e=>e.textContent.trim().toLowerCase().includes({:?}.toLowerCase())); if(t){{t.click(); return 'fallback clicked';}} return 'fallback not found'; }})()", name.to_lowercase());
-                        if let Ok(v) = rt_client::evaluate_sync(&js, false) {
-                            if v.to_string().contains("fallback clicked") { res = Ok(v); }
-                        }
+            if res.is_ok() {
+                crate::stagehand::instrumentation::METRICS.record_tier("a11y");
+                let res = res?;
+                return Ok(json!({"success": true, "actionDescription": instruction, "actions": [llm_resp], "result": res, "xpathMap": snap.combined_xpath_map, "tier": "a11y"}));
+            }
+            let err_str = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+            if err_str.contains("Could not find object") || err_str.contains("not found") {
+                let elem_id = llm_resp.get("elementId").and_then(|v| v.as_str()).unwrap_or("");
+                let name = find_name_for_id(&snap.combined_tree, elem_id).unwrap_or_else(|| extract_target_from_instruction(instruction));
+                if !name.is_empty() {
+                    let js = format!("(() => {{ const els=[...document.querySelectorAll('button, [role=\"button\"], a, div, span')]; const t=els.find(e=>e.textContent.trim().toLowerCase().includes({:?}.toLowerCase())); if(t){{t.click(); return 'fallback clicked';}} return 'fallback not found'; }})()", name.to_lowercase());
+                    if let Ok(v) = rt_client::evaluate_sync(&js, false) {
+                        if v.to_string().contains("fallback clicked") { res = Ok(v); }
                     }
                 }
             }
-            let res = res?;
-            return Ok(json!({"success": true, "actionDescription": instruction, "actions": [llm_resp], "result": res, "xpathMap": snap.combined_xpath_map}));
+            if res.is_ok() {
+                crate::stagehand::instrumentation::METRICS.record_tier("a11y");
+                let v = res?;
+                return Ok(json!({"success": true, "actionDescription": instruction, "actions": [llm_resp], "result": v, "xpathMap": snap.combined_xpath_map, "tier": "a11y"}));
+            }
+            // a11y failed -> try hint/vision before declaring failure
+            let method = llm_resp.get("method").and_then(|v| v.as_str()).unwrap_or("click");
+            let type_text = llm_resp.get("arguments").and_then(|v| v.as_array()).and_then(|a| a.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(v) = try_hint_vision_fallback(instruction, method, type_text, &mut tier, &mut hint_label, &mut vision_used) {
+                return Ok(json!({"success": true, "actionDescription": instruction, "actions": [llm_resp], "result": v, "xpathMap": snap.combined_xpath_map, "tier": tier, "hintLabel": hint_label, "vision": vision_used}));
+            }
+            // fall through to explicit null handling below
         }
-        return Ok(json!({"success": false, "message": format!("LLM did not return actionable element: {}", llm_resp), "actions": [], "llm": llm_resp}));
+        if is_explicit_null {
+            // Try fallback tiers even when LLM says no element — hint may still find it
+            let method_guess = if instruction.to_lowercase().contains("type") || instruction.to_lowercase().contains("fill") { "type" } else { "click" };
+            if let Some(v) = try_hint_vision_fallback(instruction, method_guess, "", &mut tier, &mut hint_label, &mut vision_used) {
+                return Ok(json!({"success": true, "actionDescription": instruction, "actions": [action_obj.clone()], "result": v, "xpathMap": snap.combined_xpath_map, "tier": tier, "hintLabel": hint_label, "vision": vision_used, "llm": llm_resp}));
+            }
+            return Ok(json!({"success": false, "message": "No action found", "actionDescription": instruction, "actions": [], "llm": llm_resp, "tier": tier}));
+        }
+        // Generic LLM malformed case: also try fallback
+        let method_guess = if instruction.to_lowercase().contains("type") || instruction.to_lowercase().contains("fill") { "type" } else { "click" };
+        if let Some(v) = try_hint_vision_fallback(instruction, method_guess, "", &mut tier, &mut hint_label, &mut vision_used) {
+            return Ok(json!({"success": true, "actionDescription": instruction, "actions": [action_obj.clone()], "result": v, "xpathMap": snap.combined_xpath_map, "tier": tier, "hintLabel": hint_label, "vision": vision_used, "llm": llm_resp}));
+        }
+        return Ok(json!({"success": false, "message": format!("LLM did not return actionable element: {}", llm_resp), "actions": [], "llm": llm_resp, "tier": tier}));
     }
 
+    let method_guess = action_obj.get("method").and_then(|v| v.as_str()).unwrap_or("click").to_string();
+    let type_text_guess = action_obj.get("arguments").and_then(|v| v.as_array()).and_then(|a| a.get(0)).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut result = execute_action(&action_obj, None);
+    // JS text fallback (preserved, still a11y tier)
     if result.is_err() {
         let err_str = result.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
         if err_str.contains("Could not find object") || err_str.contains("backend") || err_str.contains("not found") {
@@ -271,7 +353,17 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
             }
         }
     }
+    // If still error after a11y + JS + self-heal: try hint then vision
+    if result.is_err() {
+        if let Some(v) = try_hint_vision_fallback(instruction, &method_guess, &type_text_guess, &mut tier, &mut hint_label, &mut vision_used) {
+            result = Ok(v);
+        }
+    }
     let result = result?;
+    // Record tier on success if not already recorded (a11y path)
+    if tier == "a11y" {
+        crate::stagehand::instrumentation::METRICS.record_tier("a11y");
+    }
 
     let two_step = action_obj.get("twoStep").and_then(|v| v.as_bool()).unwrap_or(false) || llm_resp.get("twoStep").and_then(|v| v.as_bool()).unwrap_or(false);
     let actions = if two_step {
@@ -309,7 +401,10 @@ pub fn act(instruction: &str, cfg: &StagehandConfig) -> Result<Value> {
         "result": result,
         "llm": llm_resp,
         "xpathMap": snap.combined_xpath_map,
-        "snapshot": snap.combined_tree.chars().take(2000).collect::<String>()
+        "snapshot": snap.combined_tree.chars().take(2000).collect::<String>(),
+        "tier": tier,
+        "hintLabel": hint_label,
+        "vision": vision_used
     }))
 }
 

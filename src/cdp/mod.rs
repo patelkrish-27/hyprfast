@@ -1,10 +1,16 @@
-//! CDP: Chrome DevTools Protocol via HTTP discovery + WebSocket JSON-RPC
-//! Phase 3: transport migrated to BrowserRuntime (persistent daemon).
-//! This module retains its public helper API for compatibility, but every
-//! call now routes through `browser_runtime::client` (daemon when alive,
-//! ephemeral BrowserRuntime fallback otherwise). No per-call WebSocket is
-//! created here — the only WebSocket connect lives in
-//! `browser_runtime/connection.rs` (invariant I2).
+//! CDP: discovery + WebSocket JSON-RPC surface
+//! v0.8: Chrome DevTools MCP (stdio) is the preferred browser backend;
+//! this module retains its public helper API for compatibility, but every
+//! call now routes through `devtools_mcp::proxy` when available, then
+//! `browser_runtime::client` (daemon when alive, ephemeral fallback otherwise).
+//! No per-call WebSocket is created here — the only WebSocket connect lives in
+//! `browser_runtime/connection.rs` (invariant I2). DevTools MCP owns its own
+//! browser connection over stdio.
+//!
+//! The old direct HTTP discovery (`GET /json` → `webSocketDebuggerUrl`) is
+//! superseded by DevTools target caching (2s TTL in proxy) and by the
+//! daemon's `Target.getTargets` over the persistent socket. HTTP remains only
+//! as a degraded fallback when both proxy and daemon are unavailable.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -35,7 +41,7 @@ pub async fn list_targets_async() -> Result<Vec<Target>> {
     let url = format!("{}/json", base);
     let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
     let resp = client.get(&url).send().await.map_err(|e| {
-        anyhow::anyhow!("CDP unreachable at {}/json ({}). Launch browser with --remote-debugging-port={} e.g. `hyprfast browser open https://example.com` or `hyprfast launch \"brave --remote-debugging-port=9222 --force-renderer-accessibility --new-window https://example.com\"`", base, e, DEFAULT_PORT)
+        anyhow::anyhow!("CDP unreachable at {}/json ({}). Launch browser with --remote-debugging-port={} e.g. `hyprfast browser open https://example.com`", base, e, DEFAULT_PORT)
     })?;
     if !resp.status().is_success() {
         bail!("CDP GET /json failed: {}", resp.status());
@@ -45,8 +51,26 @@ pub async fn list_targets_async() -> Result<Vec<Target>> {
 }
 
 pub fn list_targets() -> Result<Vec<Target>> {
-    // Phase 3: try daemon's tabs path first (still Target.getTargets via persistent WS);
-    // fall back to HTTP discovery when daemon not alive.
+    // v0.8: prefer DevTools MCP proxy (2s target cache) when available.
+    if crate::devtools_mcp::process::devtools_proxy_enabled() {
+        let proxy_res = crate::devtools_mcp::proxy::proxy_block_on(async {
+            crate::devtools_mcp::proxy::global_proxy().tabs().await
+        });
+        if let Ok(v) = proxy_res {
+            if let Some(arr) = v.get("targets").and_then(|x| x.as_array()) {
+                let out: Vec<Target> = arr.iter().filter_map(|o| {
+                    Some(Target {
+                        id: o.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        title: o.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        url: o.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        web_socket_debugger_url: o.get("ws").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        typ: o.get("type").and_then(|x| x.as_str()).unwrap_or("page").to_string(),
+                    })
+                }).collect();
+                if !out.is_empty() { return Ok(out); }
+            }
+        }
+    }
     let v = crate::browser_runtime::client::cdp_call_sync(
         "Target.getTargets",
         json!({}),
@@ -58,22 +82,17 @@ pub fn list_targets() -> Result<Vec<Target>> {
         if let Some(infos) = val.get("targetInfos").and_then(|x| x.as_array()) {
             let mut out = Vec::new();
             for info in infos {
-                // Map CDP TargetInfo to our Target shape (best-effort)
                 let id = info.get("targetId").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let title = info.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let url = info.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let typ = info.get("type").and_then(|x| x.as_str()).unwrap_or("page").to_string();
                 out.push(Target { id, title, url, web_socket_debugger_url: String::new(), typ });
             }
-            if !out.is_empty() {
-                return Ok(out);
-            }
+            if !out.is_empty() { return Ok(out); }
         }
     }
-    // Fallback to HTTP /json (works even without daemon)
     futures::executor::block_on(list_targets_async()).or_else(|_| {
-        // If even CDP via daemon failed and HTTP failed, propagate HTTP error
-        Err(anyhow::anyhow!("list_targets: daemon and HTTP discovery both failed"))
+        Err(anyhow::anyhow!("list_targets: proxy, daemon and HTTP discovery all failed"))
     })
 }
 
@@ -85,7 +104,8 @@ pub async fn list_targets_filtered_async(typ: Option<&str>) -> Result<Vec<Target
 }
 
 pub fn version() -> Result<Value> {
-    // Browser.getVersion via persistent transport when possible.
+    // Prefer DevTools MCP path via proxy's evaluate? But Browser.getVersion is not a proxy tool.
+    // Try daemon's Browser.getVersion first.
     let v = crate::browser_runtime::client::cdp_call_sync(
         "Browser.getVersion",
         json!({}),
@@ -93,10 +113,7 @@ pub fn version() -> Result<Value> {
         None,
         crate::browser_runtime::server::CapabilityClass::None,
     );
-    if let Ok(val) = v {
-        return Ok(val);
-    }
-    // Fallback to HTTP /json/version
+    if let Ok(val) = v { return Ok(val); }
     futures::executor::block_on(async {
         let base = cdp_base_url();
         let url = format!("{}/json/version", base);
@@ -106,9 +123,10 @@ pub fn version() -> Result<Value> {
     })
 }
 
-// WS discovery is now owned by BrowserRuntime/targets (Phase 5); these wrappers
-// are retained for compat but route through the same discovery as the daemon.
+// WS discovery is superseded by DevTools proxy target caching + daemon's flat session.
+// These helpers remain for fallback callers but now prefer the managed paths.
 pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> {
+    // Deprecated: WS URLs are owned by the daemon/proxy. Fall back to HTTP list only when needed.
     let targets = list_targets_async().await?;
     if targets.is_empty() {
         bail!("no debuggable targets at {} — launch browser with --remote-debugging-port={} (e.g. brave --remote-debugging-port=9222 --force-renderer-accessibility)", cdp_base_url(), DEFAULT_PORT);
@@ -126,7 +144,7 @@ pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> 
     for t in pages.iter().rev() {
         if !t.web_socket_debugger_url.is_empty() { return Ok(t.web_socket_debugger_url.clone()); }
     }
-    bail!("no page with webSocketDebuggerUrl")
+    bail!("no page with webSocketDebuggerUrl (WS discovery superseded by devtools-mcp/daemon)")
 }
 
 pub fn get_ws_url(target_match: Option<&str>) -> Result<String> {
@@ -134,6 +152,19 @@ pub fn get_ws_url(target_match: Option<&str>) -> Result<String> {
 }
 
 pub async fn new_page_async(url: &str) -> Result<Target> {
+    // Prefer proxy new_page when available (no HTTP /json/new needed).
+    if crate::devtools_mcp::process::devtools_proxy_enabled() {
+        let proxy_res = crate::devtools_mcp::proxy::proxy_block_on(async {
+            crate::devtools_mcp::proxy::global_proxy().open(url).await
+        });
+        // If proxy opened, synthesize Target from its result and return.
+        if proxy_res.is_ok() {
+            // Fall back to list to get canonical Target shape
+            if let Ok(targets) = list_targets_async().await {
+                if let Some(t) = targets.into_iter().find(|t| t.url.contains(url)) { return Ok(t); }
+            }
+        }
+    }
     let base = cdp_base_url();
     let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
     let v: Value = client.put(format!("{}/json/new", base)).query(&[("url", url)]).send().await?.json().await?;
@@ -141,10 +172,9 @@ pub async fn new_page_async(url: &str) -> Result<Target> {
     Ok(t)
 }
 
-// ---- WebSocket JSON-RPC via BrowserRuntime (no direct WS connect here) ----
+// ---- WebSocket JSON-RPC via BrowserRuntime / DevTools proxy (no direct WS connect here) ----
 
 pub async fn cdp_call_async(_ws_url: &str, method: &str, params: Value) -> Result<Value> {
-    // ws_url is ignored: call goes via persistent daemon (or ephemeral fallback).
     crate::browser_runtime::client::try_cdp_call_via_daemon(
         method,
         params,
@@ -160,7 +190,6 @@ pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value> {
     futures::executor::block_on(cdp_call_async(ws_url, method, params))
 }
 
-/// Send multiple calls via persistent transport (multiplexed, not serial throwaway WS).
 pub async fn cdp_batch_async(ws_url: &str, calls: Vec<(&str, Value)>) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for (method, params) in calls {
@@ -182,14 +211,11 @@ pub fn call_on(_match_str: Option<&str>, method: &str, params: Value) -> Result<
     cdp_call("", method, params)
 }
 
-/// Evaluate JS in main frame: Runtime.evaluate
 pub fn evaluate(expression: &str, await_promise: bool) -> Result<Value> {
     crate::browser_runtime::client::evaluate_sync(expression, await_promise)
 }
 
-/// DOM snapshot via Runtime.evaluate -> outerHTML + AX built in JS (fallback when Accessibility domain not ready)
 pub fn ensure_enabled() -> Result<()> {
-    // Page/DOM/Runtime.enable — best-effort, capability none (read/setup)
     let _ = crate::browser_runtime::client::cdp_call_sync(
         "Page.enable",
         json!({}),

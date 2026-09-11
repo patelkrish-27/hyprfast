@@ -353,6 +353,22 @@ pub async fn try_cdp_call_via_daemon(
     target_id: Option<&str>,
     capability: CapabilityClass,
 ) -> RuntimeResult<Value> {
+    // DevTools MCP proxy: prefer stdio proxy when available (owns browser connection).
+    // Maps a subset of CDP methods to equivalent DevTools MCP tools, preserving semantics.
+    if crate::devtools_mcp::process::devtools_proxy_enabled() {
+        if crate::devtools_mcp::proxy::global_proxy().is_available().await {
+            if let Some(res) = try_devtools_proxy_for_cdp(method, &params).await {
+                match res {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        // Proxy attempted but failed — fall through to daemon path with warning,
+                        // do not silently swallow proxy errors for actionable diagnostics.
+                        tracing::warn!(method, error=%e, "devtools-mcp proxy failed, falling back to daemon");
+                    }
+                }
+            }
+        }
+    }
     if daemon_available().await {
         let mut conn = ClientConn::connect(&browser_socket_path()).await?;
         return conn.cdp_call(method, params, session_id, target_id, capability).await;
@@ -362,6 +378,53 @@ pub async fn try_cdp_call_via_daemon(
         method
     );
     ephemeral_cdp_call(method, params, session_id).await
+}
+
+async fn try_devtools_proxy_for_cdp(method: &str, params: &Value) -> Option<RuntimeResult<Value>> {
+    let proxy = crate::devtools_mcp::proxy::global_proxy();
+    match method {
+        "Runtime.evaluate" => {
+            let expr = params.get("expression").and_then(|v| v.as_str()).unwrap_or("");
+            if expr.is_empty() { return None; }
+            match proxy.evaluate(expr).await {
+                Ok(v) => Some(Ok(v)),
+                Err(e) => Some(Err(RuntimeError::InvalidResponse(e.to_string()))),
+            }
+        }
+        "Page.captureScreenshot" => {
+            match proxy.screenshot().await {
+                Ok((bytes, meta)) => {
+                    use base64::Engine;
+                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    let mut out = meta;
+                    out["data"] = Value::String(data);
+                    Some(Ok(out))
+                }
+                Err(e) => Some(Err(RuntimeError::InvalidResponse(e.to_string()))),
+            }
+        }
+        "Accessibility.getFullAXTree" => {
+            match proxy.snapshot(60).await {
+                Ok(v) => Some(Ok(v)),
+                Err(e) => Some(Err(RuntimeError::InvalidResponse(e.to_string()))),
+            }
+        }
+        "Target.getTargets" => {
+            match proxy.tabs().await {
+                Ok(v) => Some(Ok(v)),
+                Err(e) => Some(Err(RuntimeError::InvalidResponse(e.to_string()))),
+            }
+        }
+        "Page.navigate" => {
+            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if url.is_empty() { return None; }
+            match proxy.navigate(url).await {
+                Ok(v) => Some(Ok(v)),
+                Err(e) => Some(Err(RuntimeError::InvalidResponse(e.to_string()))),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Sync wrapper for `try_cdp_call_via_daemon` (for sync browser/stagehand helpers).

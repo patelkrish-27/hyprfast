@@ -13,6 +13,9 @@ mod browser;
 mod stagehand;
 mod ground;
 mod browser_runtime;
+mod devtools_mcp;
+mod hint;
+mod excalidraw;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -111,6 +114,32 @@ enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+enum ExcalidrawCmd {
+    /// Ensure https://excalidraw.com is open (creates tab if needed)
+    Open { #[arg(default_value="https://excalidraw.com/")] url: String },
+    /// Get current scene (elements + appState)
+    GetScene,
+    /// Clear canvas (remove all elements)
+    Clear,
+    /// Update scene: JSON {elements:[...], mode: append|replace, commitToHistory:bool}
+    UpdateScene { json: String },
+    /// Draw single primitive: type rectangle|ellipse|diamond|arrow|line|text|freedraw|frame|stickynote — JSON opts {x,y,width,height,x2,y2,text,label,strokeColor,backgroundColor,fillStyle,strokeWidth,points,name,children}
+    Draw { json: String },
+    /// Batch draw: JSON array of primitives [{type,x,y,width,height,...}]
+    DrawBatch { json: String },
+    /// High-level diagram: kind flowchart|sequence|microservices|architecture|aws|3tier|network|er|custom — params JSON
+    Diagram { kind: String, #[arg(default_value="{}")] params: String },
+    /// Export: opts JSON {format: png|svg|clipboard, background:bool, dark:bool, embedScene:bool, scale:1|2|3}
+    Export { #[arg(default_value="{\"format\":\"png\"}")] opts: String },
+    /// Save scene as .excalidraw JSON to path (triggers download)
+    Save { #[arg(default_value="/tmp/excalidraw-scene.excalidraw")] path: String },
+    /// Viewport: get or set {scrollX,scrollY,zoom:{value},viewBackgroundColor}
+    View { #[arg(default_value="")] json: String },
+    /// Center viewport on content (zoom to fit)
+    Fit,
+}
+
+#[derive(Subcommand)]
 enum Commands {
     Desktop,
     Hypr { action: String, #[arg(default_value="")] target: String, #[arg(default_value="")] workspace: String },
@@ -138,6 +167,19 @@ enum Commands {
     ActFast { instruction: String, #[arg(long, default_value="click")] action: String, #[arg(long, default_value="")] text: String, #[arg(long)] window: Option<String> },
     /// Batch fused steps: JSON array [{instruction,action,text}]
     ActBatch { steps: String, #[arg(long)] window: Option<String> },
+    /// Hint-key overlay: scan DOM for clickable elements and show labels
+    HintSnapshot,
+    /// Click element by hint label (e.g. hyprfast hint-click A)
+    HintClick { label: String },
+    /// Type text into element by hint label (e.g. hyprfast hint-type A "hello")
+    HintType { label: String, text: String },
+    /// Vimium-primary: snapshot+resolve+click/type in one call (heuristic→LLM, vision last resort)
+    HintAct { instruction: String, #[arg(long, default_value="click")] action: String, #[arg(long, default_value="")] text: String },
+    /// Vimium-primary parallel batch: one snapshot + batched LLM + parallel dispatches
+    HintBatch { steps: String },
+    /// Clear hint overlay
+    HintClear,
+    Excalidraw { #[command(subcommand)] cmd: ExcalidrawCmd },
     Mcp,
 }
 
@@ -411,6 +453,73 @@ fn main() -> Result<()> {
             let out = ground::act_batch(&v, &window.unwrap_or_default())?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
+        Some(Commands::HintSnapshot) => {
+            let v = hint::hint_snapshot()?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::HintClick { label }) => {
+            let v = hint::hint_click(&label)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::HintType { label, text }) => {
+            let v = hint::hint_type(&label, &text)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::HintAct { instruction, action, text }) => {
+            let cfg = stagehand::StagehandConfig::from_env();
+            let v = hint::hint_act(&instruction, &action, &text, &cfg)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::HintBatch { steps }) => {
+            let v: Value = serde_json::from_str(&steps).unwrap_or(Value::Null);
+            let arr = if let Some(a) = v.as_array() { a.clone() } else if let Some(o) = v.get("steps").and_then(|x| x.as_array()) { o.clone() } else { vec![v] };
+            let cfg = stagehand::StagehandConfig::from_env();
+            let out = hint::hint_batch(&arr.iter().cloned().collect::<Vec<_>>(), &cfg)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Some(Commands::HintClear) => {
+            let v = hint::hint_clear()?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(Commands::Excalidraw { cmd }) => {
+            let res = match cmd {
+                ExcalidrawCmd::Open { url } => excalidraw::ensure_open(Some(&url))?,
+                ExcalidrawCmd::GetScene => excalidraw::get_scene()?,
+                ExcalidrawCmd::Clear => excalidraw::clear_scene()?,
+                ExcalidrawCmd::UpdateScene { json } => {
+                    let v: Value = serde_json::from_str(&json).unwrap_or(serde_json::json!({"elements":[]}));
+                    let els = v.get("elements").and_then(|x| x.as_array()).cloned().unwrap_or_else(|| v.as_array().cloned().unwrap_or_default());
+                    let mode = v.get("mode").cloned().unwrap_or(serde_json::json!("append"));
+                    excalidraw::update_scene(els, &serde_json::json!({"mode": mode}))?
+                },
+                ExcalidrawCmd::Draw { json } => {
+                    let v: Value = serde_json::from_str(&json).unwrap_or(Value::Null);
+                    excalidraw::draw_primitive(&v)?
+                },
+                ExcalidrawCmd::DrawBatch { json } => {
+                    let v: Value = serde_json::from_str(&json).unwrap_or(Value::Null);
+                    let arr = if let Some(a)=v.as_array() { a.clone() } else if let Some(a)=v.get("elements").and_then(|x| x.as_array()) { a.clone() } else { vec![v] };
+                    excalidraw::draw_batch(&arr)?
+                },
+                ExcalidrawCmd::Diagram { kind, params } => {
+                    let p: Value = serde_json::from_str(&params).unwrap_or(serde_json::json!({}));
+                    excalidraw::build_diagram(&kind, &p)?
+                },
+                ExcalidrawCmd::Export { opts } => {
+                    let v: Value = serde_json::from_str(&opts).unwrap_or(serde_json::json!({}));
+                    excalidraw::export_image(&v)?
+                },
+                ExcalidrawCmd::Save { path } => excalidraw::save_scene_file(Some(&path))?,
+                ExcalidrawCmd::View { json } => {
+                    if json.trim().is_empty() { excalidraw::get_view()? } else {
+                        let v: Value = serde_json::from_str(&json).unwrap_or(serde_json::json!({}));
+                        excalidraw::set_view(&v)?
+                    }
+                },
+                ExcalidrawCmd::Fit => excalidraw::scroll_to_content()?,
+            };
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
         Some(Commands::Mcp) | None => { run_mcp()?; }
     }
     Ok(())
@@ -491,7 +600,24 @@ fn run_mcp() -> Result<()> {
         {"name":"ground","description":"Fast visual grounding: screenshot + Gemini Flash -> {x,y} global coords. Works on canvas/draw/color-pickers where AX has no tree.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"window":{"type":"string"},"region":{"type":"string"}},"required":["instruction"]}},
         {"name":"act_fast","description":"Fused ground+click/type/key in ONE call (Astra-like). instruction + action click|type|key + text. No snapshot loop.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string"},"text":{"type":"string"},"window":{"type":"string"}},"required":["instruction"]}},
         {"name":"act_batch","description":"Batch fused steps [{instruction,action,text}] in one MCP call. Max 12 steps.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"]}},
-        {"name":"browser_execute_plan","description":"Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract/go_back/tabs/snapshot. Validates syntax without eagerly resolving post-navigation targets. Additive — single-action browser_* tools remain.","inputSchema":{"type":"object","properties":{"plan":{"type":"object","description":"ExecutionPlan {steps:[{type:'navigate',url},{type:'type',text,selector},{type:'wait',url_contains},{type:'extract',selector}] }"},"steps":{"type":"array","description":"alias for plan.steps"}},"required":[]}}
+        {"name":"browser_execute_plan","description":"Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract/go_back/tabs/snapshot. Validates syntax without eagerly resolving post-navigation targets. Additive — single-action browser_* tools remain.","inputSchema":{"type":"object","properties":{"plan":{"type":"object","description":"ExecutionPlan {steps:[{type:'navigate',url},{type:'type',text,selector},{type:'wait',url_contains},{type:'extract',selector}] }"},"steps":{"type":"array","description":"alias for plan.steps"}},"required":[]}},
+        {"name":"hint_snapshot","description":"Hint-key: scan DOM for clickable/typeable elements and overlay labels A S D F etc. Returns {hints:[{label,tag,role,name,rect,selector,text}]}","inputSchema":{"type":"object","properties":{}}},
+        {"name":"hint_click","description":"Hint-key: click element by label from hint_snapshot (e.g. A)","inputSchema":{"type":"object","properties":{"label":{"type":"string","description":"hint label like A or AA"}},"required":["label"]}},
+        {"name":"hint_type","description":"Hint-key: focus element by label and type text","inputSchema":{"type":"object","properties":{"label":{"type":"string"},"text":{"type":"string"}},"required":["label","text"]}},
+        {"name":"hint_act","description":"Vimium-primary: hint_act in one call - snapshot+heuristic/LLM pick+click/type, vision last resort if no hints. instruction e.g. 'click login button'","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string","description":"click|type|fill"},"text":{"type":"string"}},"required":["instruction"]}},
+        {"name":"hint_batch","description":"Vimium-primary parallel batch: one snapshot + batched LLM + parallel hint_click/type. steps [{instruction,action,text}] max 12, kept screenshot+vision fallback per-step if no hints","inputSchema":{"type":"object","properties":{"steps":{"type":"array","items":{"type":"object"}}},"required":["steps"]}},
+        {"name":"hint_clear","description":"Clear hint overlay","inputSchema":{"type":"object","properties":{}}},
+        {"name":"excalidraw_open","description":"Excalidraw: ensure https://excalidraw.com is open (lightning: creates tab if needed)","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"optional url default https://excalidraw.com/"}},"required":[]}},
+        {"name":"excalidraw_get_scene","description":"Excalidraw: get current scene elements + appState (counts, bbox)","inputSchema":{"type":"object","properties":{}}},
+        {"name":"excalidraw_clear","description":"Excalidraw: clear canvas (remove all elements) — instant via updateScene","inputSchema":{"type":"object","properties":{}}},
+        {"name":"excalidraw_draw","description":"Excalidraw lightning draw single primitive: {type: rectangle|ellipse|diamond|arrow|line|text|freedraw|frame|stickynote, x,y,width,height,x2,y2,text,label,strokeColor,backgroundColor,fillStyle,strokeWidth,points,name,children} — instant via excalidrawAPI.updateScene (<120ms)","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"rectangle|ellipse|diamond|arrow|line|text|freedraw|frame|stickynote"},"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number"},"height":{"type":"number"},"x2":{"type":"number"},"y2":{"type":"number"},"text":{"type":"string"},"label":{"type":"string"},"strokeColor":{"type":"string"},"backgroundColor":{"type":"string"},"fillStyle":{"type":"string"},"json":{"type":"string","description":"alt: full JSON opts string"}},"required":[]}},
+        {"name":"excalidraw_draw_batch","description":"Excalidraw lightning batch draw: array of primitives [{type,x,y,width,height,text,label,...}] — one updateScene for N elements (~120ms for 50)","inputSchema":{"type":"object","properties":{"elements":{"type":"array","description":"array of primitive JSON objects"},"json":{"type":"string","description":"alt JSON string of array"}},"required":[]}},
+        {"name":"excalidraw_update_scene","description":"Excalidraw: update scene elements directly — {elements:[ExcalidrawElement,...], mode: append|replace} — fastest for complex diagrams","inputSchema":{"type":"object","properties":{"elements":{"type":"array"},"mode":{"type":"string","description":"append|replace default append"},"json":{"type":"string"}},"required":[]}},
+        {"name":"excalidraw_diagram","description":"Excalidraw lightning diagrams: kind flowchart|sequence|microservices|architecture|aws|3tier|network|er|custom — params {title, services, databases, participants, messages, nodes, entities, elements} — auto-layout + arrows + fit","inputSchema":{"type":"object","properties":{"kind":{"type":"string","description":"flowchart|sequence|microservices|architecture|aws|3tier|network|er|custom"},"params":{"type":"object","description":"{title, services:[], databases:[], participants:[], messages:[], nodes:[], entities:[], steps:[], elements:[]}"},"title":{"type":"string"},"json":{"type":"string"}},"required":["kind"]}},
+        {"name":"excalidraw_export","description":"Excalidraw export: {format: png|svg|clipboard, background:bool, dark:bool, embedScene:bool, scale:1|2|3} — uses canvas toDataURL / triggers download","inputSchema":{"type":"object","properties":{"format":{"type":"string"},"background":{"type":"boolean"},"dark":{"type":"boolean"},"embedScene":{"type":"boolean"},"scale":{"type":"integer"}},"required":[]}},
+        {"name":"excalidraw_save","description":"Excalidraw: trigger Save to file (.excalidraw JSON) download + return JSON length","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"suggested path default /tmp/excalidraw-scene.excalidraw"}},"required":[]}},
+        {"name":"excalidraw_view","description":"Excalidraw viewport: get or set {scrollX,scrollY,zoom:{value},viewBackgroundColor,theme,gridModeEnabled} — empty args = get","inputSchema":{"type":"object","properties":{"json":{"type":"string","description":"JSON view patch or empty for get"},"scrollX":{"type":"number"},"scrollY":{"type":"number"},"zoom":{"type":"number"}},"required":[]}},
+        {"name":"excalidraw_fit","description":"Excalidraw: center viewport on content (zoom to fit) — auto-fits bbox","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in reader.lines() {
         let line = line?;
@@ -806,6 +932,95 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let v = if plan_val.get("steps").is_some() || plan_val.is_array() { plan_val } else if args.get("steps").is_some() { serde_json::json!({"steps": args.get("steps").unwrap()}) } else { args.clone() };
             crate::browser_runtime::client::execute_plan_sync(v)
         },
+        "hint_snapshot" => hint::hint_snapshot(),
+        "hint_click" => {
+            let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            hint::hint_click(label)
+        },
+        "hint_type" => {
+            let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            hint::hint_type(label, text)
+        },
+        "hint_act" => {
+            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let cfg = stagehand::StagehandConfig::from_env();
+            hint::hint_act(instruction, action, text, &cfg)
+        },
+        "hint_batch" => {
+            let steps = args.get("steps").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| args.as_array().cloned().unwrap_or_default());
+            let cfg = stagehand::StagehandConfig::from_env();
+            hint::hint_batch(&steps, &cfg)
+        },
+        "hint_clear" => hint::hint_clear(),
+        // ---- Excalidraw lightning tools ----
+        "excalidraw_open" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("https://excalidraw.com/");
+            excalidraw::ensure_open(Some(url))
+        },
+        "excalidraw_get_scene" => excalidraw::get_scene(),
+        "excalidraw_clear" => excalidraw::clear_scene(),
+        "excalidraw_draw" => {
+            // Support both flat args and json string arg
+            let v = if args.get("json").is_some() {
+                let s = args.get("json").and_then(|v| v.as_str()).unwrap_or("{}");
+                serde_json::from_str(s).unwrap_or(args.clone())
+            } else if args.get("type").is_some() { args.clone() } else { args.clone() };
+            // also accept single object wrapped
+            excalidraw::draw_primitive(&v)
+        },
+        "excalidraw_draw_batch" => {
+            let arr = if let Some(s) = args.get("json").and_then(|v| v.as_str()) {
+                serde_json::from_str::<Value>(s).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default()
+            } else if let Some(a) = args.get("elements").and_then(|v| v.as_array()) { a.clone() }
+            else if let Some(a) = args.as_array() { a.clone() }
+            else { vec![args.clone()] };
+            excalidraw::draw_batch(&arr)
+        },
+        "excalidraw_update_scene" => {
+            let (els, mode) = if let Some(s)=args.get("json").and_then(|v| v.as_str()) {
+                let v: Value = serde_json::from_str(s).unwrap_or(serde_json::json!({}));
+                (v.get("elements").and_then(|x| x.as_array()).cloned().unwrap_or_default(), v.get("mode").and_then(|x| x.as_str()).unwrap_or("append").to_string())
+            } else {
+                (args.get("elements").and_then(|v| v.as_array()).cloned().unwrap_or_default(), args.get("mode").and_then(|v| v.as_str()).unwrap_or("append").to_string())
+            };
+            excalidraw::update_scene(els, &serde_json::json!({"mode": mode}))
+        },
+        "excalidraw_diagram" => {
+            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("flowchart");
+            let params = if let Some(s)=args.get("json").and_then(|v| v.as_str()) { serde_json::from_str(s).unwrap_or(serde_json::json!({})) }
+            else if args.get("params").is_some() { args.get("params").cloned().unwrap() }
+            else {
+                let mut p=serde_json::json!({});
+                if let Some(t)=args.get("title").and_then(|v| v.as_str()) { p["title"]=serde_json::json!(t); }
+                // pass through any other keys as params
+                for k in ["services","databases","participants","messages","nodes","entities","steps","elements"] {
+                    if let Some(v)=args.get(k) { p[k]=v.clone(); }
+                }
+                p
+            };
+            excalidraw::build_diagram(kind, &params)
+        },
+        "excalidraw_export" => {
+            let opts = if args.get("json").is_some() {
+                let s=args.get("json").and_then(|v| v.as_str()).unwrap_or("{}");
+                serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+            } else { args.clone() };
+            excalidraw::export_image(&opts)
+        },
+        "excalidraw_save" => {
+            let p = args.get("path").and_then(|v| v.as_str()).unwrap_or("/tmp/excalidraw-scene.excalidraw");
+            excalidraw::save_scene_file(Some(p))
+        },
+        "excalidraw_view" => {
+            if args.get("json").is_some() || args.get("scrollX").is_some() || args.get("scrollY").is_some() || args.get("zoom").is_some() {
+                let v = if let Some(s)=args.get("json").and_then(|v| v.as_str()) { serde_json::from_str(s).unwrap_or(serde_json::json!({})) } else { args.clone() };
+                if v.as_object().map(|o| o.is_empty()).unwrap_or(true) { excalidraw::get_view() } else { excalidraw::set_view(&v) }
+            } else { excalidraw::get_view() }
+        },
+        "excalidraw_fit" => excalidraw::scroll_to_content(),
         _ => anyhow::bail!("unknown tool {}", name),
     }
 }

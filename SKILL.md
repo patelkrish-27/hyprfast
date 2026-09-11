@@ -1,15 +1,15 @@
 ---
 name: hyprfast
-description: Fast Rust alternative to hypruse — persistent Hyprland IPC + direct zbus AT-SPI + CDP browser automation + Stagehand LLM (act/observe/extract/agent) + Task State (task_init/status/update), MCP+CLI. Use whenever you need desktop/window/workspace ops, AT-SPI clicks, Brave/Chromium automation via Chrome DevTools, WhatsApp Web, or multi-step todo tracking. Consult for hyprfast's desktop/hypr/launch/ui/click_ui/pointer/keyboard/screenshot/wait_for/binds + browser_navigate/snapshot/click/type/evaluate/screenshot/tabs + stagehand_act/observe/extract/agent + task_init/status/update/clear/next tools. Routed via skills/opencode/SKILL.md rows 5-7.
+description: Fast Rust alternative to hypruse — persistent Hyprland IPC + direct zbus AT-SPI + CDP browser automation + Stagehand LLM (act/observe/extract/agent) + Task State (task_init/status/update) + Excalidraw lightning (excalidraw_draw/diagram/export), MCP+CLI. Use whenever you need desktop/window/workspace ops, AT-SPI clicks, Brave/Chromium automation via Chrome DevTools, WhatsApp Web, multi-step todo tracking, or Excalidraw whiteboard diagrams/architecture. Consult for hyprfast's desktop/hypr/launch/ui/click_ui/pointer/keyboard/screenshot/wait_for/binds + browser_navigate/snapshot/click/type/evaluate/screenshot/tabs + stagehand_act/observe/extract/agent + task_init/status/update/clear/next + excalidraw_draw/diagram/export/fit tools. Routed via skills/opencode/SKILL.md rows 5-7.
 ---
 
 > **Router:** Routed via `skills/opencode/SKILL.md` master router (rows 5-7, 10). **Browser tasks:** read `skill/browser/SKILL.md` first for snapshot & ref recipes and Gemini Copy-button canonical (§ Session Learnings 2026-08-31) — this file owns *transport* (CDP/Stagehand/Hyprland), not recipes. **Unified priority (0.6):** Stagehand → Eval → Snapshot → Screenshot.
 
-# hyprfast — fast hypruse alternative (0.6.1 with Stagehand + Task State)
+# hyprfast — fast hypruse alternative (0.9.0-dev with Stagehand + Task State + Excalidraw Lightning)
 
-`hyprfast` is `hypruse` without the forks: direct Unix socket to Hyprland (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, `j/<cmd>`), persistent `zbus` D-Bus to `org.a11y.Bus` (no `busctl` per node), `DoAction` clicks (no `movecursor`+`click`), optional `hyprfastd` daemon cache, **plus built-in CDP browser automation + Stagehand LLM (no Node, no @browsermcp/mcp)** — one binary for Hyprland + AT-SPI + Chrome DevTools + `google/gemini-2.5-flash`/`openai/gpt-4o`.
+`hyprfast` is `hypruse` without the forks: direct Unix socket to Hyprland (`$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, `j/<cmd>`), persistent `zbus` D-Bus to `org.a11y.Bus` (no `busctl` per node), `DoAction` clicks (no `movecursor`+`click`), optional `hyprfastd` daemon cache, **plus built-in CDP browser automation + Stagehand LLM (no Node, no @browsermcp/mcp) + Excalidraw lightning** — one binary for Hyprland + AT-SPI + Chrome DevTools + `google/gemini-2.5-flash`/`openai/gpt-4o` + `https://excalidraw.com` whiteboard.
 
-Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds`) **plus** `browser_*` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, etc.) **plus** `stagehand_*` (`stagehand_act`, `stagehand_observe`, `stagehand_extract`, `stagehand_agent`, `stagehand_snapshot`) **plus** `task_*` (`task_init`, `task_status`, `task_update`, `task_add`, `task_clear`, `task_next`) — full `browsermcp` + `stagehand` parity via `src/cdp/mod.rs:30` + `src/browser/mod.rs:1` + `src/stagehand/*` + `src/task.rs:1`, but `~10-150×` faster and 0 extra deps. Version `0.6.1` `src/main.rs:1` `Cargo.toml:3` `src/task.rs:1` (47 tools).
+Same MCP shape as `hypruse` (`desktop`, `hypr`, `launch`, `ui`, `click_ui`, `pointer`, `keyboard`, `screenshot`, `wait_for`, `binds`) **plus** `browser_*` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, etc.) **plus** `stagehand_*` (`stagehand_act`, `stagehand_observe`, `stagehand_extract`, `stagehand_agent`, `stagehand_snapshot`) **plus** `task_*` (`task_init`, `task_status`, `task_update`, `task_add`, `task_clear`, `task_next`) **plus** `excalidraw_*` (`excalidraw_draw`, `excalidraw_draw_batch`, `excalidraw_diagram`, `excalidraw_export`, `excalidraw_fit`, etc.) — full `browsermcp` + `stagehand` + `excalidraw.com` parity via `src/cdp/mod.rs:30` + `src/browser/mod.rs:1` + `src/stagehand/*` + `src/task.rs:1` + `src/excalidraw/mod.rs:1`, but `~10-150×` faster and 0 extra deps. Version `0.9.0-dev` `src/main.rs:1` `Cargo.toml:3` `src/task.rs:1` `src/excalidraw/mod.rs:1` (68 tools).
 
 ## Prerequisite — Read Browser Skill First (router enforced)
 
@@ -55,6 +55,13 @@ Do NOT start `hyprfast browser_*` without `browser` — see `Root Cause Analysis
 | **Task status (resume)** | `task_status` / `hyprfast task status` — current todo + progress % + next pending |
 | **Task update (mark done)** | `task_update index=0 status="completed"` / `hyprfast task update --index 0 completed` — auto-clears when all done |
 | **Task next / add / clear** | `task_next` / `task_add description="new step"` / `task_clear` / `hyprfast task next/add/clear` |
+| **Excalidraw open** | `excalidraw_open url="https://excalidraw.com/"` / `hyprfast excalidraw open` — ensure tab |
+| **Excalidraw draw** | `excalidraw_draw type="rectangle" x=100 y=100 width=200 height=80 backgroundColor="#a5d8ff" label="Backend"` / `hyprfast excalidraw draw '{"type":"rectangle","x":100,"y":100,"width":200,"height":80,"label":"Backend"}'` — instant via `excalidrawAPI.updateScene` (~120ms) |
+| **Excalidraw batch** | `excalidraw_draw_batch elements=[{type:"rectangle",...},{type:"arrow",x2:400}]` / `hyprfast excalidraw draw-batch '[{"type":"rectangle",...}]'` — one updateScene for N |
+| **Excalidraw diagram** | `excalidraw_diagram kind="microservices" params={title,services,databases}` / `hyprfast excalidraw diagram microservices '{"services":["API Gateway","Auth"],"databases":["Postgres"]}'` — auto-layout flowchart/sequence/aws/3tier/network/er/custom |
+| **Excalidraw scene** | `excalidraw_get_scene` / `excalidraw_clear` / `excalidraw_update_scene elements=[...] mode=append\|replace` / `hyprfast excalidraw get-scene` |
+| **Excalidraw export** | `excalidraw_export format="png" scale=1 background=true` / `hyprfast excalidraw export '{"format":"png"}'` — canvas `toDataURL` + CDP `browser_screenshot` for full PNG |
+| **Excalidraw view / fit** | `excalidraw_view json="{\"scrollX\":0}"` / `excalidraw_fit` / `hyprfast excalidraw fit` — viewport + auto-center bbox zoom 0.7 |
 
 **Rules from hyprsuse still apply:**
 - `desktop` first, then act on `address`. Never screenshot to locate windows.
@@ -351,6 +358,62 @@ No duplicate tab `0BF421`, no wasted `browser_snapshot` on wrong target.
 - Auto-clear means `task_status` returns `{"status":"empty"}` — next task starts clean.
 
 **See:** `browser/SKILL.md § Session Learnings 2026-09-04` (recipe) + `opencode/SKILL.md §3` (global resume rule).
+
+## Excalidraw Lightning — whiteboard diagrams at 10× speed (0.9.0, `src/excalidraw/mod.rs:1`)
+
+hyprfast now embeds **Excalidraw lightning automation** for `https://excalidraw.com` — deep capture of every shortcut/canvas/export + instant scene injection via live `excalidrawAPI`. Use for *any* architecture, flow, sequence, network, ER, or complex diagram without pointer drag (2-4s per shape → ~120ms per 50 shapes).
+
+**Capture summary (`docs/excalidraw-capture.md:1`):** Tools `H/V/R/D/O/A/L/P/T/N/9/E/F/K/B/I` + View `Ctrl+/- 0 Shift+1/2 Alt+Z/S/R` + Editor `Ctrl+G/D/Z, Align, Group, Flip`; Canvas dual `canvas.static`+`interactive` `1882×858` + `SVGLayer` + `textEditor`; State `excalidraw-state` 40 keys (`scrollX 1312 scrollY 1282 zoom 0.2`); Data model `ExcalidrawElement` full spec (rect/diamond/ellipse/arrow/line/freedraw/text/image/frame/sticky, `boundElements`, `frameId`, `index a1` z-order, `seed/versionNonce`); Export `ImageExportModal` `Background|Dark|EmbedScene|Scale 1×/2×/3×` → PNG/SVG/Clipboard + Save `.excalidraw` + Live collaboration `excalidraw-collab`.
+
+**Why lightning, not pointer:** Excalidraw stores scene in `excalidrawAPI` (found via `__reactFiber*` BFS `memoizedProps.excalidrawAPI` `src/excalidraw/mod.rs:42`). Full element JSON built in Rust (`base_element` + `expand_label` bound-text) injected via single `Runtime.evaluate` `updateScene` — no drag, no `pointer`, instant re-render. Fallback `localStorage+reload` only if API missing.
+
+**MCP tools (11, 68 total):**
+
+| Tool | Params | When |
+|---|---|---|
+| `excalidraw_open` | `url?` (default `https://excalidraw.com/`) | Ensure tab before any draw |
+| `excalidraw_get_scene` | — | Audit `elements.length + appState` |
+| `excalidraw_clear` | — | Reset `[]` |
+| `excalidraw_draw` | `type` `x,y,width,height,x2,y2,text,label,strokeColor,backgroundColor,fillStyle,strokeWidth,points,name` | Single primitive |
+| `excalidraw_draw_batch` | `elements: [{type,…}]` | Batch N primitives in one `updateScene` |
+| `excalidraw_update_scene` | `elements: ExcalidrawElement[]`, `mode: append\|replace` | Raw scene for complex/custom |
+| `excalidraw_diagram` | `kind: flowchart\|sequence\|microservices\|architecture\|aws\|3tier\|network\|er\|custom`, `params: {title,services,databases,participants,messages,nodes,entities,steps,elements}` | Auto-layout template + `fit` bbox `zoom 0.7` |
+| `excalidraw_export` | `format png\|svg\|clipboard, background, dark, embedScene, scale` | `canvas.toDataURL` + `browser_screenshot` for full PNG |
+| `excalidraw_save` | `path?` | Trigger `.excalidraw` download |
+| `excalidraw_view` | `json {scrollX,scrollY,zoom:{value}}` or empty = get | Viewport |
+| `excalidraw_fit` | — | Center on bbox |
+
+**CLI (`hyprfast excalidraw`):**
+```bash
+hyprfast excalidraw open                                    # https://excalidraw.com/
+hyprfast excalidraw clear
+hyprfast excalidraw draw '{"type":"rectangle","x":100,"y":100,"width":200,"height":80,"backgroundColor":"#a5d8ff","label":"Backend"}'
+hyprfast excalidraw draw-batch '[{"type":"rectangle","x":100,"y":200,"width":180,"height":70,"label":"Service A"},{"type":"arrow","x":280,"y":235,"x2":400,"y2":235}]'
+hyprfast excalidraw diagram flowchart '{"title":"CI/CD","steps":["Commit","Test","Build","Deploy"]}'
+hyprfast excalidraw diagram microservices '{"title":"E-Commerce","services":["API Gateway","Auth","Catalog","Orders"],"databases":["Postgres","Redis","S3"]}'
+hyprfast excalidraw diagram sequence '{"participants":["Client","API","DB"],"messages":["GET /users","SELECT","rows","JSON"]}'
+hyprfast excalidraw diagram network '{"nodes":["Internet","WAF","ALB","EC2","RDS"]}'
+hyprfast excalidraw diagram er '{"entities":["User","Order","Product"]}'
+hyprfast excalidraw get-scene                                # {elements, appState, files}
+hyprfast excalidraw export '{"format":"png","scale":1}'      # {dataUrlPrefix, dataUrlLength}
+hyprfast excalidraw fit                                      # auto-center
+hyprfast browser shot                                        # full viewport PNG for vision verify
+```
+
+**Canonical AI workflow (mandatory for diagram tasks):**
+```json
+1. excalidraw_open → ensure https://excalidraw.com/ is active tab (check browser_tabs if >1 page, activate Excalidraw)
+2. excalidraw_clear  // or skip if appending
+3. excalidraw_diagram kind="microservices" params={title:"My Architecture", services:["API Gateway","Auth","Orders"], databases:["Postgres"]} → {elements:30, scene:{after:30}}
+   // or excalidraw_draw_batch elements=[{type:"rectangle",x:100,...},{type:"arrow",x2:400}]
+4. excalidraw_fit  // center + zoom 0.7
+5. verify: excalidraw_get_scene (elements.length) + browser_screenshot (CDP Page.captureScreenshot) or excalidraw_export
+```
+Lightning in one MCP call: `excalidraw_diagram` draws full architecture (~120ms) without `pointer`/`keyboard`. Use `excalidraw_draw_batch` for fully custom layouts; `excalidraw_update_scene mode=replace` for exact scene replay from saved `.excalidraw` JSON.
+
+**Perf:** pointer drag `~3s` per shape vs `updateScene` `~120ms` per 50 → **~25×** for flowchart (12 els), **~10×** for microservices (30 els). Auto-index `aN` keeps z-order stable.
+
+**See:** `docs/excalidraw-capture.md` (full shortcuts/canvas/data model/export dump) + `src/excalidraw/mod.rs:1` (builders: `build_rectangle/ellipse/diamond/text/arrow/line/freedraw/frame/stickynote` + `build_diagram` templates).
 
 ## Safety
 
