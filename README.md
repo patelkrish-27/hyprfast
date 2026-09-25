@@ -1,4 +1,4 @@
-# hyprfast — fast hypruse alternative (Rust)
+# hyprfast
 
 **hypruse is slow because it forks.** `hyprfast` fixes that.
 | hypruse 0.9.4 (Python) | hyprfast 0.9.0 (Rust) | speedup |
@@ -129,9 +129,3 @@ See `src/stagehand/mod.rs:1` for module map; skipped `sdk-go`/`sdk-python`/`exam
 - [x] v0.7: Astra-like visual grounding — `ground` (screenshot JPEG 0.5x + Gemini Flash vision → `{x,y}`, `src/ground.rs:1`), fused `act_fast`/`act_batch` (ground+click/type in ONE MCP call, OS pointer = trusted gesture for canvas/draw/color-pickers), CDP ws_url 2s cache (`src/cdp/mod.rs:63`), 50 MCP tools
 - [x] v0.8: Chrome DevTools MCP backend + Hint-key Vimium-primary (parallel) — **DevTools MCP** `npx chrome-devtools-mcp@latest` stdio proxy (`src/devtools_mcp/process.rs:1`, `proxy.rs:1`), all `browser_*` tools route through proxy when available with 2s DevTools target/session cache, legacy `BrowserRuntime` daemon remains as fallback, `--workspace` launch flag and single `connect_async` invariant preserved (`src/browser_runtime/connection.rs:364`) + **Hint Vimium-primary** `hint_snapshot`/`hint_click`/`hint_type`/`hint_act`/`hint_batch`/`hint_clear` (`assets/hint.js`, `src/hint/mod.rs:1`), DOM scan + labeled overlay + shadow piercing + `[draggable]` + parallel `hint_batch` (1 snapshot + batched LLM + `thread::scope` parallel dispatch, CDP concurrent per rule 29, per-target queue via server), **order** `hint (Vimium-primary, parallel) → a11y → vision (kept if nothing works, `src/ground.rs:1` last resort)` (`src/stagehand/act.rs:1` hint_act fast path before AX, `src/stagehand/observe.rs:1`), heuristic exact-text fast-path + batched LLM (`src/hint/mod.rs:resolve`), `stagehand_metrics` tier `a11y`/`hint`/`vision` + per-step logging in `src/stagehand/agent.rs:1`, 57 MCP tools (`Cargo.toml:3` `0.8.0-dev`)
 - [x] v0.9: Excalidraw Lightning — **Excalidraw** whiteboard automation (`src/excalidraw/mod.rs:1`) deep capture (80 shortcuts, dual canvas `1882×858`, export `Background|Dark|EmbedScene|Scale`, full `ExcalidrawElement` spec) + **lightning injection** via live `excalidrawAPI.updateScene` (React Fiber `__reactFiber*` BFS `memoizedProps.excalidrawAPI`, `src/excalidraw/mod.rs:42`) `~120ms/50` vs `~3s` pointer drag (**25×**), 11 tools `excalidraw_open/get_scene/clear/draw/draw_batch/update_scene/diagram/export/save/view/fit` (`src/main.rs:1` + MCP `handle_tool`), templates `flowchart|sequence|microservices|architecture|aws|3tier|network|er|custom` auto-layout + `fit` bbox `zoom 0.7`, 68 MCP tools (`Cargo.toml:3` `0.9.0-dev`) — any architecture/diagram/complex drawing in one call (`docs/excalidraw-capture.md:1`)
-
-## Why not just optimize hypruse?
-
-hypruse is correct and safe (session lock guards, confinement). Fixing it in Python still pays fork cost. The real win is persistent connections, which wants a compiled daemon — Rust gives <5ms startup and <1MB RSS.
-
-Contributions welcome. See `src/hypr/mod.rs` for IPC, `src/a11y/mod.rs` for AT-SPI.

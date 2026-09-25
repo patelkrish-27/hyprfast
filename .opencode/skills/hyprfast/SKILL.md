@@ -79,7 +79,7 @@ hyprfast handles WhatsApp Web via keyboard chords through `keyboard action=key k
 ### Canonical flows
 
 **Send `hello` to `Khushi` (Web) — no screenshot needed (keyboard-only, ~0.8s):**
-```json
+```text
 {"tool":"desktop"}
 → {"tool":"hypr","action":"focus_window","target":"0x...brave..."}
 → {"tool":"keyboard","action":"key","keys":"ctrl+alt+slash","window":"0x..."}
@@ -109,7 +109,7 @@ hyprfast handles WhatsApp Web via keyboard chords through `keyboard action=key k
 **How to find unused:** `desktop.workspaces` where `windows==0` → pick first empty `id` (usually 3..10). If none, use `10`.
 
 **Flow:**
-```json
+```text
 {"tool":"desktop"} // inspect brave window at/size vs monitors geometry, check fullscreen
 // if not fullscreen:
 → {"tool":"hypr","action":"move_window","target":"0x...brave...","workspace":"3"}
@@ -130,7 +130,7 @@ Every `screenshot` (CLI `hyprfast screenshot --window ...` or MCP `screenshot`) 
 - **Pattern:** Do task with zero or more screenshots → on success `clear_screenshots` → next task starts clean. On failure, keep shots for debugging then `clear --all`.
 
 Example:
-```json
+```text
 {"tool":"screenshot","window":"0x..."} → {"path":"/tmp/hyprfast-....png"}
 {"tool":"clear_screenshots","all":false} → {"removed":3,"bytes_freed":480000}
 ```

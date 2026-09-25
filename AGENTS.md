@@ -8,8 +8,6 @@ This project is mid-implementation of a persistent browser automation
 runtime. The full spec — non-negotiable contract, architectural
 invariants, and every phase's agent prompt + DoD — lives at:
 
-`docs/hyprfast-browserruntime-plan-v3.md`
-
 Before writing any code in this area, read the specific phase section
 named in the user's current request from that file. Do not rely on
 memory of earlier turns for its contents — re-read it.
@@ -46,3 +44,16 @@ memory of earlier turns for its contents — re-read it.
    known issue is fixed in a later phase (see Phase 3 → Phase 6 in the
    plan), do not fix it early even if you notice it — record it as
    already-scheduled instead.
+8. **Build release after features.** After implementing a feature, run
+   `cargo build --release` and fix any errors before reporting done.
+   A debug-only `cargo build` is not sufficient.
+9. **Install to PATH after release build.** After `cargo build --release` succeeds, run `cargo install --path .` (or `cp target/release/hyprfast ~/.cargo/bin/hyprfast`) so the `hyprfast` on `PATH` reflects the new code. Without this, `hyprfast categories` / `hyprfast category` will show stale output from `~/.cargo/bin/hyprfast`.
+10. **User-facing smoke test required.** After implementing a feature,
+   prove a real user can invoke it directly end-to-end — run the
+   actual public entry point (CLI command, MCP tool call, etc.) exactly
+   as a user would and paste its real output. Do NOT substitute
+   internal/debugging paths (unit tests alone, `cargo test`, direct
+   calls to internal fns, debug flags, test fixtures wired around the
+   public interface) for this check. If the feature cannot be
+   exercised through its public interface in this session, write
+   `NOT RUN` and say why. Always test via the `PATH` binary (`hyprfast ...`), not just `./target/debug/hyprfast` or `./target/release/hyprfast`.

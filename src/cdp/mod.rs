@@ -50,6 +50,24 @@ pub async fn list_targets_async() -> Result<Vec<Target>> {
     Ok(targets)
 }
 
+fn tokio_block_on<F, T>(f: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    // Use a fresh OS thread + current_thread runtime so we never panic with
+    // "there is no reactor running" (futures::executor) or "cannot start a runtime from within a runtime".
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for blocking cdp")
+            .block_on(f)
+    })
+    .join()
+    .expect("tokio_block_on thread join")
+}
+
 pub fn list_targets() -> Result<Vec<Target>> {
     // v0.8: prefer DevTools MCP proxy (2s target cache) when available.
     if crate::devtools_mcp::process::devtools_proxy_enabled() {
@@ -91,7 +109,7 @@ pub fn list_targets() -> Result<Vec<Target>> {
             if !out.is_empty() { return Ok(out); }
         }
     }
-    futures::executor::block_on(list_targets_async()).or_else(|_| {
+    tokio_block_on(list_targets_async()).or_else(|_| {
         Err(anyhow::anyhow!("list_targets: proxy, daemon and HTTP discovery all failed"))
     })
 }
@@ -114,12 +132,12 @@ pub fn version() -> Result<Value> {
         crate::browser_runtime::server::CapabilityClass::None,
     );
     if let Ok(val) = v { return Ok(val); }
-    futures::executor::block_on(async {
+    tokio_block_on(async {
         let base = cdp_base_url();
         let url = format!("{}/json/version", base);
         let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
         let v: Value = client.get(&url).send().await?.json().await?;
-        Ok(v)
+        Ok::<Value, anyhow::Error>(v)
     })
 }
 
@@ -148,7 +166,16 @@ pub async fn get_ws_url_async(target_url_match: Option<&str>) -> Result<String> 
 }
 
 pub fn get_ws_url(target_match: Option<&str>) -> Result<String> {
-    futures::executor::block_on(get_ws_url_async(target_match))
+    let m = target_match.map(|s| s.to_owned());
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(get_ws_url_async(m.as_deref()))
+    })
+    .join()
+    .expect("thread join")
 }
 
 pub async fn new_page_async(url: &str) -> Result<Target> {
@@ -187,7 +214,17 @@ pub async fn cdp_call_async(_ws_url: &str, method: &str, params: Value) -> Resul
 }
 
 pub fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value> {
-    futures::executor::block_on(cdp_call_async(ws_url, method, params))
+    let ws = ws_url.to_owned();
+    let m = method.to_owned();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(cdp_call_async(&ws, &m, params))
+    })
+    .join()
+    .expect("thread join")
 }
 
 pub async fn cdp_batch_async(ws_url: &str, calls: Vec<(&str, Value)>) -> Result<Vec<Value>> {
@@ -199,7 +236,23 @@ pub async fn cdp_batch_async(ws_url: &str, calls: Vec<(&str, Value)>) -> Result<
 }
 
 pub fn cdp_batch(ws_url: &str, calls: Vec<(&str, Value)>) -> Result<Vec<Value>> {
-    futures::executor::block_on(cdp_batch_async(ws_url, calls))
+    let ws = ws_url.to_owned();
+    let owned_calls: Vec<(String, Value)> = calls.into_iter().map(|(m, p)| (m.to_owned(), p)).collect();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(async {
+                let mut out = Vec::new();
+                for (method, params) in owned_calls {
+                    out.push(cdp_call_async(&ws, &method, params).await?);
+                }
+                Ok::<Vec<Value>, anyhow::Error>(out)
+            })
+    })
+    .join()
+    .expect("thread join")
 }
 
 // ---- Helpers that combine discovery + ws ----

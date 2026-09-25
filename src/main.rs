@@ -141,25 +141,42 @@ enum ExcalidrawCmd {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Instant desktop snapshot (no screenshot, <5ms) — windows, workspaces, monitors
     Desktop,
-    Hypr { action: String, #[arg(default_value="")] target: String, #[arg(default_value="")] workspace: String },
-    Launch { command: String, #[arg(long)] workspace: Option<String> },
-    Ui { #[arg(long)] window: Option<String>, #[arg(long, default_value="")] name: String },
-    Click { name: String, #[arg(long)] window: Option<String> },
-    Pointer { action: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, #[arg(long, default_value="left")] button: String, #[arg(long)] to_x: Option<f64>, #[arg(long)] to_y: Option<f64>, #[arg(long, default_value="0")] dy: f64, #[arg(long, default_value="0")] dx: f64 },
-    Keyboard { action: String, #[arg(long, default_value="")] text: String, #[arg(long, default_value="")] keys: String, #[arg(long)] window: Option<String> },
-    Screenshot { #[arg(long)] window: Option<String>, #[arg(long)] region: Option<String> },
-    Wait { event: String, #[arg(long, default_value="")] match_str: String, #[arg(long, default_value="5")] timeout: f64 },
+    /// Hyprland IPC: workspace/focus_window/move_window/close_window/fullscreen/toggle_floating
+    Hypr { #[arg(help="Action: workspace|focus_window|move_window|close_window|fullscreen|toggle_floating")] action: String, #[arg(default_value="", help="Target window address or workspace name")] target: String, #[arg(default_value="", help="Workspace name (for move_window)")] workspace: String },
+    /// Launch app via Hyprland exec (auto-adds --remote-debugging-port=9222 for browsers)
+    Launch { #[arg(help="Command to launch, e.g. 'brave --new-window https://example.com'")] command: String, #[arg(long, help="Hyprland workspace to launch on")] workspace: Option<String> },
+    /// AT-SPI accessible tree (fast, no screenshot) — list elements by window/name filter
+    Ui { #[arg(long, help="Filter by window address or title substring")] window: Option<String>, #[arg(long, default_value="", help="Filter by accessible name substring (empty = all)")] name: String },
+    /// Click AT-SPI element by accessible name via DoAction (no pointer, no screenshot)
+    Click { #[arg(help="Accessible name to click")] name: String, #[arg(long, help="Window address/title to scope search")] window: Option<String> },
+    /// Mouse: move|click|drag|scroll at global logical coords
+    Pointer { #[arg(help="Action: move|click|drag|scroll")] action: String, #[arg(long, help="X coordinate")] x: Option<f64>, #[arg(long, help="Y coordinate")] y: Option<f64>, #[arg(long, default_value="left", help="Mouse button: left|right|middle")] button: String, #[arg(long, help="Destination X (for drag)")] to_x: Option<f64>, #[arg(long, help="Destination Y (for drag)")] to_y: Option<f64>, #[arg(long, default_value="0", help="Scroll delta Y (for scroll)")] dy: f64, #[arg(long, default_value="0", help="Scroll delta X (for scroll)")] dx: f64 },
+    /// Keyboard: type (text) or key (combo like ctrl+t) — optionally focuses window first
+    Keyboard { #[arg(help="Action: type|key")] action: String, #[arg(long, default_value="", help="Text to type (for action=type)")] text: String, #[arg(long, default_value="", help="Key combo like ctrl+t, Enter, Escape (for action=key)")] keys: String, #[arg(long, help="Window address to focus first")] window: Option<String> },
+    /// Capture via grim: window, region, or monitor. Returns file path + meta (auto-tracked for session clear)
+    Screenshot { #[arg(long, help="Window address/title to capture")] window: Option<String>, #[arg(long, help="Region WxH+X+Y or monitor name")] region: Option<String> },
+    /// Block on Hyprland events: window_open/window_close/workspace/title_change/layer_open/layer_close
+    Wait { #[arg(help="Event: window_open|window_close|workspace|title_change|layer_open|layer_close")] event: String, #[arg(long, default_value="", help="Substring to match on window title/workspace")] match_str: String, #[arg(long, default_value="5", help="Timeout seconds")] timeout: f64 },
+    /// List Hyprland keybinds
     Binds,
-    Daemon { #[arg(long)] stop: bool },
-    Clear { #[arg(long)] all: bool },
-    Session { action: String },
+    /// (legacy) Hypr IPC daemon — start/stop persistent helper (see browser-runtime for CDP daemon)
+    Daemon { #[arg(long, help="Stop daemon and remove socket")] stop: bool },
+    /// Clear tracked screenshots (/tmp/hyprfast-*.png) — deletes session files; --all for untracked leftovers
+    Clear { #[arg(long, help="Also delete untracked /tmp/hyprfast-*.png leftovers")] all: bool },
+    /// Screenshot session: status/clear/list tracked files
+    Session { #[arg(help="Action: status|clear|clear_all|list")] action: String },
+    /// Task state: init/add/update/status/next/clear — multi-step todo tracking
     Task { #[command(subcommand)] cmd: TaskCmd },
+    /// CDP browser automation: navigate/click/type/eval/tabs/snapshot (via persistent BrowserRuntime)
     Browser { #[command(subcommand)] cmd: BrowserCmd },
+    /// Persistent browser-runtime daemon (single CDP WS) — start/stop/status
     BrowserRuntime { #[command(subcommand)] cmd: BrowserRuntimeCmd },
     /// Internal: daemon serve loop (spawned detached by `browser-runtime start`)
     #[command(hide = true)]
     BrowserRuntimeInternalServe,
+    /// Stagehand LLM-driven browser automation: act/observe/extract/agent (requires OPENAI_API_KEY)
     Stagehand { #[command(subcommand)] cmd: StagehandCmd },
     /// Fast visual grounding: screenshot + Gemini Flash -> {x,y}
     Ground { instruction: String, #[arg(long)] window: Option<String>, #[arg(long)] region: Option<String> },
@@ -167,19 +184,25 @@ enum Commands {
     ActFast { instruction: String, #[arg(long, default_value="click")] action: String, #[arg(long, default_value="")] text: String, #[arg(long)] window: Option<String> },
     /// Batch fused steps: JSON array [{instruction,action,text}]
     ActBatch { steps: String, #[arg(long)] window: Option<String> },
-    /// Hint-key overlay: scan DOM for clickable elements and show labels
-    HintSnapshot,
+    /// Hint-key overlay: scan DOM for clickable elements and show labels (add --target to pick tab without focusing)
+    HintSnapshot { #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring (e.g. '1', 'excalidraw', 'google.com')")] target: Option<String> },
     /// Click element by hint label (e.g. hyprfast hint-click A)
-    HintClick { label: String },
+    HintClick { label: String, #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring")] target: Option<String> },
     /// Type text into element by hint label (e.g. hyprfast hint-type A "hello")
-    HintType { label: String, text: String },
+    HintType { label: String, text: String, #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring")] target: Option<String> },
     /// Vimium-primary: snapshot+resolve+click/type in one call (heuristic→LLM, vision last resort)
-    HintAct { instruction: String, #[arg(long, default_value="click")] action: String, #[arg(long, default_value="")] text: String },
+    HintAct { instruction: String, #[arg(long, default_value="click")] action: String, #[arg(long, default_value="")] text: String, #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring")] target: Option<String> },
     /// Vimium-primary parallel batch: one snapshot + batched LLM + parallel dispatches
-    HintBatch { steps: String },
+    HintBatch { steps: String, #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring")] target: Option<String> },
     /// Clear hint overlay
-    HintClear,
+    HintClear { #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring")] target: Option<String> },
+    /// Excalidraw automation: open/scene/draw/diagram/export/view/fit
     Excalidraw { #[command(subcommand)] cmd: ExcalidrawCmd },
+    /// Laya Pass-1: list 8 tool categories (category_name + description)
+    Categories,
+    /// Laya Pass-2: show category + its commands with descriptions
+    Category { #[arg(help="Category name: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw")] category: String },
+    /// Run as MCP server (stdio JSON-RPC) — exposes all tools to LLM clients (default when no command given)
     Mcp,
 }
 
@@ -193,6 +216,155 @@ fn ensure_browser_args(cmd: &str) -> String {
         return format!("{} --remote-debugging-port=9222", cmd);
     }
     cmd.to_string()
+}
+
+// --- Laya 2-pass helpers (README-laya.md) ---
+
+fn laya_categories_value() -> serde_json::Value {
+    serde_json::json!({
+        "total": 8,
+        "categories": [
+            {"category_name": "core-desktop", "description": "Hyprland desktop — snapshot, hypr, launch, binds, wait_for"},
+            {"category_name": "perceive", "description": "Perceive — read-only: ui, screenshot, browser_snapshot, tabs, console, context_pages, session_status"},
+            {"category_name": "native-act", "description": "Native act — click_ui, pointer, keyboard"},
+            {"category_name": "browser-act", "description": "Browser act — deterministic CDP: navigate, click, type, eval, etc."},
+            {"category_name": "smart-llm", "description": "Smart LLM — stagehand act/observe/extract/agent"},
+            {"category_name": "fast-ground", "description": "Fast ground — hint_* + ground/act_fast (vision fallback for canvas/WebGL)"},
+            {"category_name": "task-memory", "description": "Task memory — task_* + clear_screenshots"},
+            {"category_name": "draw", "description": "Draw — excalidraw whiteboard / architecture diagrams"}
+        ]
+    })
+}
+
+fn laya_category_value(name: &str) -> anyhow::Result<serde_json::Value> {
+    let key = name.trim().to_lowercase().replace('_', "-");
+    let v = match key.as_str() {
+        "core-desktop" | "core" | "desktop" => serde_json::json!({
+            "category_name": "core-desktop",
+            "description": "Hyprland desktop — snapshot, hypr, launch, binds, wait_for",
+            "total_commands": 5,
+            "commands": [
+                {"command_name": "desktop", "description": "Instant desktop snapshot (no screenshot, <5ms)"},
+                {"command_name": "hypr", "description": "Window/workspace ops: workspace/focus_window/move_window/close_window/fullscreen/toggle_floating"},
+                {"command_name": "launch", "description": "Launch app via Hyprland exec (auto-adds --remote-debugging-port=9222 for browsers)"},
+                {"command_name": "binds", "description": "List Hyprland keybinds"},
+                {"command_name": "wait_for", "description": "Block on Hyprland events: window_open/window_close/workspace/title_change/layer_open/layer_close"}
+            ]
+        }),
+        "perceive" => serde_json::json!({
+            "category_name": "perceive",
+            "description": "Perceive — read-only: ui, screenshot, browser_snapshot, tabs, console, context_pages, session_status",
+            "total_commands": 7,
+            "commands": [
+                {"command_name": "ui", "description": "AT-SPI accessible tree (fast, no screenshot)"},
+                {"command_name": "screenshot", "description": "Capture via grim: window, region, or monitor. Returns file path + meta"},
+                {"command_name": "browser_snapshot", "description": "CDP: capture accessibility snapshot (AX tree via Accessibility.getFullAXTree)"},
+                {"command_name": "browser_tabs", "description": "CDP: list browser tabs/targets (GET /json)"},
+                {"command_name": "browser_console", "description": "CDP: get console logs (Console.enable)"},
+                {"command_name": "context_pages", "description": "Stagehand context.pages: list pages via CDP Target.getTargets"},
+                {"command_name": "session_status", "description": "Show screenshot session status (tracked files, bytes)"}
+            ]
+        }),
+        "native-act" | "native" => serde_json::json!({
+            "category_name": "native-act",
+            "description": "Native act — click_ui, pointer, keyboard",
+            "total_commands": 3,
+            "commands": [
+                {"command_name": "click_ui", "description": "Click by accessible name via DoAction (no pointer, no screenshot)"},
+                {"command_name": "pointer", "description": "Mouse: move|click|drag|scroll at global logical coords"},
+                {"command_name": "keyboard", "description": "Keyboard: type (text) or key (combo like ctrl+t). window focuses first."}
+            ]
+        }),
+        "browser-act" | "browser" => serde_json::json!({
+            "category_name": "browser-act",
+            "description": "Browser act — deterministic CDP: navigate, click, type, eval, etc.",
+            "total_commands": 16,
+            "commands": [
+                {"command_name": "browser_navigate", "description": "CDP: navigate browser tab to URL (auto-discovers ws://9222)"},
+                {"command_name": "browser_open", "description": "Hypr+CDP: launch Brave with --remote-debugging-port=9222"},
+                {"command_name": "browser_go_back", "description": "CDP: go back (history.back)"},
+                {"command_name": "browser_go_forward", "description": "CDP: go forward (history.forward)"},
+                {"command_name": "browser_click", "description": "CDP: click element. Use ref from snapshot or CSS selector"},
+                {"command_name": "browser_hover", "description": "CDP: hover element"},
+                {"command_name": "browser_type", "description": "CDP: type text into editable element (ref from snapshot)"},
+                {"command_name": "browser_select_option", "description": "CDP: select option in dropdown"},
+                {"command_name": "browser_press_key", "description": "CDP: press key (Enter, Escape, ArrowLeft, etc) via Input.dispatchKeyEvent"},
+                {"command_name": "browser_wait", "description": "CDP: wait N seconds (browser)"},
+                {"command_name": "browser_evaluate", "description": "CDP: evaluate JavaScript in page (Runtime.evaluate)"},
+                {"command_name": "browser_screenshot", "description": "CDP: capture browser tab screenshot via Page.captureScreenshot (PNG, no grim)"},
+                {"command_name": "browser_execute_plan", "description": "Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract"},
+                {"command_name": "clipboard_write", "description": "Clipboard write via CDP"},
+                {"command_name": "clipboard_read", "description": "Clipboard read via CDP"},
+                {"command_name": "cookies_set", "description": "Set cookies via Storage.setCookies"}
+            ]
+        }),
+        "smart-llm" | "smart" | "llm" | "stagehand" => serde_json::json!({
+            "category_name": "smart-llm",
+            "description": "Smart LLM — stagehand act/observe/extract/agent",
+            "total_commands": 9,
+            "commands": [
+                {"command_name": "stagehand_act", "description": "Stagehand act: natural language browser action (LLM → CDP)"},
+                {"command_name": "stagehand_observe", "description": "Stagehand observe: discover actionable elements matching instruction"},
+                {"command_name": "stagehand_extract", "description": "Stagehand extract: LLM extracts structured data from page"},
+                {"command_name": "stagehand_agent", "description": "Stagehand agent: autonomous loop act/extract until goal complete"},
+                {"command_name": "stagehand_snapshot", "description": "Stagehand hybrid snapshot: Accessibility.getFullAXTree + xpathMap"},
+                {"command_name": "stagehand_cache", "description": "Stagehand cache: status/clear for act cache"},
+                {"command_name": "stagehand_metrics", "description": "Stagehand metrics: aggregate token usage for act/observe/extract"},
+                {"command_name": "stagehand_batch", "description": "Stagehand experimentalBatch: run serialized callbackSource in browser context"},
+                {"command_name": "stagehand_webmcp", "description": "Stagehand WebMCP: list_tools/invoke_tool via page __webmcp"}
+            ]
+        }),
+        "fast-ground" | "fast" | "ground" | "hint" => serde_json::json!({
+            "category_name": "fast-ground",
+            "description": "Fast ground — hint_* + ground/act_fast (vision fallback for canvas/WebGL) — now targetable: --target 1|url|title",
+            "total_commands": 9,
+            "commands": [
+                {"command_name": "hint_snapshot", "description": "Hint-key overlay: scan DOM for clickable elements and show labels — add --target 1|excalidraw|targetId to pick tab without focusing"},
+                {"command_name": "hint_click", "description": "Click element by hint label (e.g. hyprfast hint-click A) — add --target to pick tab"},
+                {"command_name": "hint_type", "description": "Type text into element by hint label — add --target to pick tab"},
+                {"command_name": "hint_act", "description": "Vimium-primary: snapshot+resolve+click/type in one call (heuristic→LLM, vision last resort) — add --target"},
+                {"command_name": "hint_batch", "description": "Vimium-primary parallel batch: one snapshot + batched LLM + parallel dispatches — add --target"},
+                {"command_name": "hint_clear", "description": "Clear hint overlay — add --target to clear specific tab"},
+                {"command_name": "ground", "description": "Fast visual grounding: screenshot + Gemini Flash -> {x,y}"},
+                {"command_name": "act_fast", "description": "Fused ground+click/type in one call (Astra-like, no N LLM turns)"},
+                {"command_name": "act_batch", "description": "Batch fused steps: JSON array [{instruction,action,text}]"}
+            ]
+        }),
+        "task-memory" | "task" | "memory" => serde_json::json!({
+            "category_name": "task-memory",
+            "description": "Task memory — task_* + clear_screenshots",
+            "total_commands": 7,
+            "commands": [
+                {"command_name": "task_init", "description": "Task state: init todo list for multi-step action"},
+                {"command_name": "task_status", "description": "Task state: show current todo list, progress % and next pending step"},
+                {"command_name": "task_update", "description": "Task state: update step status (pending|in_progress|completed|failed|skipped)"},
+                {"command_name": "task_next", "description": "Task state: get next pending step"},
+                {"command_name": "task_add", "description": "Task state: add a new step to current task list"},
+                {"command_name": "task_clear", "description": "Task state: manually clear current task list"},
+                {"command_name": "clear_screenshots", "description": "Clear tracked screenshots (/tmp/hyprfast-*.png) — use all=true for leftovers"}
+            ]
+        }),
+        "draw" | "excalidraw" => serde_json::json!({
+            "category_name": "draw",
+            "description": "Draw — excalidraw whiteboard / architecture diagrams",
+            "total_commands": 11,
+            "commands": [
+                {"command_name": "excalidraw_open", "description": "Excalidraw: ensure https://excalidraw.com is open"},
+                {"command_name": "excalidraw_get_scene", "description": "Excalidraw: get current scene elements + appState (counts, bbox)"},
+                {"command_name": "excalidraw_clear", "description": "Excalidraw: clear canvas (remove all elements)"},
+                {"command_name": "excalidraw_draw", "description": "Excalidraw lightning draw single primitive: {type: rectangle|ellipse|...}"},
+                {"command_name": "excalidraw_draw_batch", "description": "Excalidraw lightning batch draw: array of primitives"},
+                {"command_name": "excalidraw_update_scene", "description": "Excalidraw: update scene elements directly — {elements:[...], mode: append|replace}"},
+                {"command_name": "excalidraw_diagram", "description": "Excalidraw lightning diagrams: kind flowchart|sequence|microservices|..."},
+                {"command_name": "excalidraw_export", "description": "Excalidraw export: {format: png|svg|clipboard, background...}"},
+                {"command_name": "excalidraw_save", "description": "Excalidraw: trigger Save to file (.excalidraw JSON)"},
+                {"command_name": "excalidraw_view", "description": "Excalidraw viewport: get or set {scrollX,scrollY,zoom:{value}...}"},
+                {"command_name": "excalidraw_fit", "description": "Excalidraw: center viewport on content (zoom to fit)"}
+            ]
+        }),
+        _ => anyhow::bail!("unknown category '{key}': use one of core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw (see `hyprfast categories`)"),
+    };
+    Ok(v)
 }
 
 fn main() -> Result<()> {
@@ -237,11 +409,17 @@ fn main() -> Result<()> {
         }
         Some(Commands::Pointer { action, x, y, button, to_x, to_y, dy, dx }) => {
             match action.as_str() {
-                "move" => { input::move_cursor(x.unwrap(), y.unwrap())?; println!("moved"); }
+                "move" => {
+                    let (xx, yy) = (x.ok_or_else(|| anyhow::anyhow!("pointer move requires --x and --y, e.g. hyprfast pointer move --x 100 --y 100"))?, y.ok_or_else(|| anyhow::anyhow!("pointer move requires --x and --y"))?);
+                    input::move_cursor(xx, yy)?; println!("moved");
+                }
                 "click" => { input::click(x, y, &button, false)?; println!("clicked"); }
-                "drag" => { input::drag(x.unwrap(), y.unwrap(), to_x.unwrap(), to_y.unwrap(), &button)?; println!("dragged"); }
+                "drag" => {
+                    let (xx, yy, txx, tyy) = (x.ok_or_else(|| anyhow::anyhow!("pointer drag requires --x --y --to-x --to-y"))?, y.ok_or_else(|| anyhow::anyhow!("pointer drag requires --x --y --to-x --to-y"))?, to_x.ok_or_else(|| anyhow::anyhow!("pointer drag requires --to-x"))?, to_y.ok_or_else(|| anyhow::anyhow!("pointer drag requires --to-y"))?);
+                    input::drag(xx, yy, txx, tyy, &button)?; println!("dragged");
+                }
                 "scroll" => { input::scroll(dy, dx, x, y)?; println!("scrolled"); }
-                _ => anyhow::bail!("unknown pointer action"),
+                _ => anyhow::bail!("unknown pointer action '{}': use move|click|drag|scroll (see --help)", action),
             }
         }
         Some(Commands::Keyboard { action, text, keys, window }) => {
@@ -453,32 +631,32 @@ fn main() -> Result<()> {
             let out = ground::act_batch(&v, &window.unwrap_or_default())?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        Some(Commands::HintSnapshot) => {
-            let v = hint::hint_snapshot()?;
+        Some(Commands::HintSnapshot { target }) => {
+            let v = hint::hint_snapshot_with_target(target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Some(Commands::HintClick { label }) => {
-            let v = hint::hint_click(&label)?;
+        Some(Commands::HintClick { label, target }) => {
+            let v = hint::hint_click_with_target(&label, target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Some(Commands::HintType { label, text }) => {
-            let v = hint::hint_type(&label, &text)?;
+        Some(Commands::HintType { label, text, target }) => {
+            let v = hint::hint_type_with_target(&label, &text, target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Some(Commands::HintAct { instruction, action, text }) => {
+        Some(Commands::HintAct { instruction, action, text, target }) => {
             let cfg = stagehand::StagehandConfig::from_env();
-            let v = hint::hint_act(&instruction, &action, &text, &cfg)?;
+            let v = hint::hint_act_with_target(&instruction, &action, &text, &cfg, target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Some(Commands::HintBatch { steps }) => {
+        Some(Commands::HintBatch { steps, target }) => {
             let v: Value = serde_json::from_str(&steps).unwrap_or(Value::Null);
             let arr = if let Some(a) = v.as_array() { a.clone() } else if let Some(o) = v.get("steps").and_then(|x| x.as_array()) { o.clone() } else { vec![v] };
             let cfg = stagehand::StagehandConfig::from_env();
-            let out = hint::hint_batch(&arr.iter().cloned().collect::<Vec<_>>(), &cfg)?;
+            let out = hint::hint_batch_with_target(&arr.iter().cloned().collect::<Vec<_>>(), &cfg, target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        Some(Commands::HintClear) => {
-            let v = hint::hint_clear()?;
+        Some(Commands::HintClear { target }) => {
+            let v = hint::hint_clear_with_target(target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Some(Commands::Excalidraw { cmd }) => {
@@ -519,6 +697,13 @@ fn main() -> Result<()> {
                 ExcalidrawCmd::Fit => excalidraw::scroll_to_content()?,
             };
             println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+        Some(Commands::Categories) => {
+            println!("{}", serde_json::to_string_pretty(&laya_categories_value())?);
+        }
+        Some(Commands::Category { category }) => {
+            let v = laya_category_value(&category)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Some(Commands::Mcp) | None => { run_mcp()?; }
     }
@@ -601,12 +786,12 @@ fn run_mcp() -> Result<()> {
         {"name":"act_fast","description":"Fused ground+click/type/key in ONE call (Astra-like). instruction + action click|type|key + text. No snapshot loop.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string"},"text":{"type":"string"},"window":{"type":"string"}},"required":["instruction"]}},
         {"name":"act_batch","description":"Batch fused steps [{instruction,action,text}] in one MCP call. Max 12 steps.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"]}},
         {"name":"browser_execute_plan","description":"Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract/go_back/tabs/snapshot. Validates syntax without eagerly resolving post-navigation targets. Additive — single-action browser_* tools remain.","inputSchema":{"type":"object","properties":{"plan":{"type":"object","description":"ExecutionPlan {steps:[{type:'navigate',url},{type:'type',text,selector},{type:'wait',url_contains},{type:'extract',selector}] }"},"steps":{"type":"array","description":"alias for plan.steps"}},"required":[]}},
-        {"name":"hint_snapshot","description":"Hint-key: scan DOM for clickable/typeable elements and overlay labels A S D F etc. Returns {hints:[{label,tag,role,name,rect,selector,text}]}","inputSchema":{"type":"object","properties":{}}},
-        {"name":"hint_click","description":"Hint-key: click element by label from hint_snapshot (e.g. A)","inputSchema":{"type":"object","properties":{"label":{"type":"string","description":"hint label like A or AA"}},"required":["label"]}},
-        {"name":"hint_type","description":"Hint-key: focus element by label and type text","inputSchema":{"type":"object","properties":{"label":{"type":"string"},"text":{"type":"string"}},"required":["label","text"]}},
-        {"name":"hint_act","description":"Vimium-primary: hint_act in one call - snapshot+heuristic/LLM pick+click/type, vision last resort if no hints. instruction e.g. 'click login button'","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string","description":"click|type|fill"},"text":{"type":"string"}},"required":["instruction"]}},
-        {"name":"hint_batch","description":"Vimium-primary parallel batch: one snapshot + batched LLM + parallel hint_click/type. steps [{instruction,action,text}] max 12, kept screenshot+vision fallback per-step if no hints","inputSchema":{"type":"object","properties":{"steps":{"type":"array","items":{"type":"object"}}},"required":["steps"]}},
-        {"name":"hint_clear","description":"Clear hint overlay","inputSchema":{"type":"object","properties":{}}},
+        {"name":"hint_snapshot","description":"Hint-key: scan DOM for clickable/typeable elements and overlay labels A S D F etc. Returns {hints:[{label,tag,role,name,rect,selector,text}]}. Add target to pick tab without focusing: 1-based index, targetId, or url/title substring (e.g. '1', 'excalidraw', 'google.com')","inputSchema":{"type":"object","properties":{"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring (e.g. '1', 'excalidraw', 'google.com')"}},"required":[]}},
+        {"name":"hint_click","description":"Hint-key: click element by label from hint_snapshot (e.g. A). Add target to pick tab without focusing.","inputSchema":{"type":"object","properties":{"label":{"type":"string","description":"hint label like A or AA"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":["label"]}},
+        {"name":"hint_type","description":"Hint-key: focus element by label and type text. Add target to pick tab without focusing.","inputSchema":{"type":"object","properties":{"label":{"type":"string"},"text":{"type":"string"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":["label","text"]}},
+        {"name":"hint_act","description":"Vimium-primary: hint_act in one call - snapshot+heuristic/LLM pick+click/type, vision last resort if no hints. instruction e.g. 'click login button'","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string","description":"click|type|fill"},"text":{"type":"string"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":["instruction"]}},
+        {"name":"hint_batch","description":"Vimium-primary parallel batch: one snapshot + batched LLM + parallel hint_click/type. steps [{instruction,action,text}] max 12, kept screenshot+vision fallback per-step if no hints","inputSchema":{"type":"object","properties":{"steps":{"type":"array","items":{"type":"object"}},"target":{"type":"string","description":"Target tab for all steps: 1-based index, targetId, or url/title substring"}},"required":["steps"]}},
+        {"name":"hint_clear","description":"Clear hint overlay","inputSchema":{"type":"object","properties":{"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":[]}},
         {"name":"excalidraw_open","description":"Excalidraw: ensure https://excalidraw.com is open (lightning: creates tab if needed)","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"optional url default https://excalidraw.com/"}},"required":[]}},
         {"name":"excalidraw_get_scene","description":"Excalidraw: get current scene elements + appState (counts, bbox)","inputSchema":{"type":"object","properties":{}}},
         {"name":"excalidraw_clear","description":"Excalidraw: clear canvas (remove all elements) — instant via updateScene","inputSchema":{"type":"object","properties":{}}},
@@ -617,6 +802,8 @@ fn run_mcp() -> Result<()> {
         {"name":"excalidraw_export","description":"Excalidraw export: {format: png|svg|clipboard, background:bool, dark:bool, embedScene:bool, scale:1|2|3} — uses canvas toDataURL / triggers download","inputSchema":{"type":"object","properties":{"format":{"type":"string"},"background":{"type":"boolean"},"dark":{"type":"boolean"},"embedScene":{"type":"boolean"},"scale":{"type":"integer"}},"required":[]}},
         {"name":"excalidraw_save","description":"Excalidraw: trigger Save to file (.excalidraw JSON) download + return JSON length","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"suggested path default /tmp/excalidraw-scene.excalidraw"}},"required":[]}},
         {"name":"excalidraw_view","description":"Excalidraw viewport: get or set {scrollX,scrollY,zoom:{value},viewBackgroundColor,theme,gridModeEnabled} — empty args = get","inputSchema":{"type":"object","properties":{"json":{"type":"string","description":"JSON view patch or empty for get"},"scrollX":{"type":"number"},"scrollY":{"type":"number"},"zoom":{"type":"number"}},"required":[]}},
+        {"name":"categories","description":"Laya Pass-1: list 8 tool categories as {category_name, description} with total count","inputSchema":{"type":"object","properties":{}}},
+        {"name":"category","description":"Laya Pass-2: show category {category_name, description, total_commands, commands:[{command_name, description}]}. category: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw","inputSchema":{"type":"object","properties":{"category":{"type":"string","description":"Category name: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw"}},"required":["category"]}},
         {"name":"excalidraw_fit","description":"Excalidraw: center viewport on content (zoom to fit) — auto-fits bbox","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in reader.lines() {
@@ -654,8 +841,14 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
             let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
             let workspace = args.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
+            // Mirror CLI: `action=workspace target=N` works when workspace is omitted
+            let ws = if workspace.is_empty() && !target.is_empty() && action == "workspace" {
+                target.to_string()
+            } else {
+                workspace.to_string()
+            };
             let (d, arg) = match action {
-                "workspace" => ("workspace", workspace.to_string()),
+                "workspace" => ("workspace", ws),
                 "focus_window" => ("focuswindow", format!("address:{}", target)),
                 "move_window" => ("movetoworkspacesilent", format!("{},address:{}", workspace, target)),
                 "close_window" => ("closewindow", format!("address:{}", target)),
@@ -932,29 +1125,39 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let v = if plan_val.get("steps").is_some() || plan_val.is_array() { plan_val } else if args.get("steps").is_some() { serde_json::json!({"steps": args.get("steps").unwrap()}) } else { args.clone() };
             crate::browser_runtime::client::execute_plan_sync(v)
         },
-        "hint_snapshot" => hint::hint_snapshot(),
+        "hint_snapshot" => {
+            let target = args.get("target").and_then(|v| v.as_str());
+            hint::hint_snapshot_with_target(target)
+        },
         "hint_click" => {
             let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
-            hint::hint_click(label)
+            let target = args.get("target").and_then(|v| v.as_str());
+            hint::hint_click_with_target(label, target)
         },
         "hint_type" => {
             let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            hint::hint_type(label, text)
+            let target = args.get("target").and_then(|v| v.as_str());
+            hint::hint_type_with_target(label, text, target)
         },
         "hint_act" => {
             let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target").and_then(|v| v.as_str());
             let cfg = stagehand::StagehandConfig::from_env();
-            hint::hint_act(instruction, action, text, &cfg)
+            hint::hint_act_with_target(instruction, action, text, &cfg, target)
         },
         "hint_batch" => {
             let steps = args.get("steps").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| args.as_array().cloned().unwrap_or_default());
+            let target = args.get("target").and_then(|v| v.as_str());
             let cfg = stagehand::StagehandConfig::from_env();
-            hint::hint_batch(&steps, &cfg)
+            hint::hint_batch_with_target(&steps, &cfg, target)
         },
-        "hint_clear" => hint::hint_clear(),
+        "hint_clear" => {
+            let target = args.get("target").and_then(|v| v.as_str());
+            hint::hint_clear_with_target(target)
+        },
         // ---- Excalidraw lightning tools ----
         "excalidraw_open" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("https://excalidraw.com/");
@@ -1021,6 +1224,13 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             } else { excalidraw::get_view() }
         },
         "excalidraw_fit" => excalidraw::scroll_to_content(),
+        "categories" => Ok(laya_categories_value()),
+        "category" => {
+            let cat = args.get("category").or_else(|| args.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            if cat.is_empty() { anyhow::bail!("category needs category name: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw"); }
+            // returns {category_name, description, total_commands, commands:[{command_name, description}]}
+            laya_category_value(cat)
+        },
         _ => anyhow::bail!("unknown tool {}", name),
     }
 }

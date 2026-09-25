@@ -16,20 +16,91 @@ fn cdp_call(method: &str, params: Value, cap: CapabilityClass) -> Result<Value> 
     crate::browser_runtime::client::cdp_call_sync(method, params, None, None, cap)
 }
 
+fn cdp_call_with_target(method: &str, params: Value, target_id: Option<&str>, cap: CapabilityClass) -> Result<Value> {
+    crate::browser_runtime::client::cdp_call_sync(method, params, None, target_id, cap)
+}
+
+fn resolve_target_id(spec: &str) -> Result<String> {
+    let v = cdp_call("Target.getTargets", json!({}), CapabilityClass::None)?;
+    let infos = v.get("targetInfos").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let pages: Vec<Value> = infos
+        .iter()
+        .filter(|t| t.get("type").and_then(|x| x.as_str()) == Some("page"))
+        .cloned()
+        .collect();
+    if pages.is_empty() {
+        bail!("no page targets found for Target.getTargets");
+    }
+    let s = spec.trim();
+    // numeric index (1-based) - e.g. "1" = first tab
+    if let Ok(idx) = s.parse::<usize>() {
+        if idx >= 1 && idx <= pages.len() {
+            if let Some(tid) = pages[idx - 1].get("targetId").and_then(|x| x.as_str()) {
+                return Ok(tid.to_string());
+            }
+        }
+    }
+    // exact targetId
+    for p in &pages {
+        if p.get("targetId").and_then(|x| x.as_str()) == Some(s) {
+            return Ok(s.to_string());
+        }
+    }
+    // substring match on url/title (case-insensitive)
+    let low = s.to_lowercase();
+    for p in &pages {
+        let url = p.get("url").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+        let title = p.get("title").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+        if url.contains(&low) || title.contains(&low) {
+            if let Some(tid) = p.get("targetId").and_then(|x| x.as_str()) {
+                return Ok(tid.to_string());
+            }
+        }
+    }
+    let available: Vec<String> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            format!(
+                "{}: title={:?} url={:?} targetId={}",
+                i + 1,
+                p.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+                p.get("url").and_then(|x| x.as_str()).unwrap_or(""),
+                p.get("targetId").and_then(|x| x.as_str()).unwrap_or("")
+            )
+        })
+        .collect();
+    bail!(
+        "no tab matches target spec '{}'. Available pages:\n{}",
+        s,
+        available.join("\n")
+    );
+}
+
 fn ensure_hint_script() -> Result<()> {
+    ensure_hint_script_with_target(None)
+}
+fn ensure_hint_script_with_target(target: Option<&str>) -> Result<()> {
+    let call = |method: &str, params: Value, cap: CapabilityClass| -> Result<Value> {
+        if let Some(tid) = target {
+            cdp_call_with_target(method, params, Some(tid), cap)
+        } else {
+            cdp_call(method, params, cap)
+        }
+    };
     // Check if already injected
     let check = json!({
         "expression": "typeof window.__hyprfastHint !== 'undefined'",
         "returnByValue": true,
         "awaitPromise": false
     });
-    let v = cdp_call("Runtime.evaluate", check, CapabilityClass::RuntimeEvaluate)?;
+    let v = call("Runtime.evaluate", check, CapabilityClass::RuntimeEvaluate)?;
     let already = v.get("result").and_then(|r| r.get("value")).and_then(|x| x.as_bool()).unwrap_or(false);
     if already {
         return Ok(());
     }
     // Inject for future navigations: Page.addScriptToEvaluateOnNewDocument
-    let _ = cdp_call(
+    let _ = call(
         "Page.addScriptToEvaluateOnNewDocument",
         json!({"source": HINT_JS}),
         CapabilityClass::None,
@@ -40,7 +111,7 @@ fn ensure_hint_script() -> Result<()> {
         "returnByValue": true,
         "awaitPromise": false
     });
-    let res = cdp_call("Runtime.evaluate", eval, CapabilityClass::RuntimeEvaluate)?;
+    let res = call("Runtime.evaluate", eval, CapabilityClass::RuntimeEvaluate)?;
     if let Some(exc) = res.get("exceptionDetails") {
         bail!("hint injection exception: {}", exc);
     }
@@ -50,7 +121,7 @@ fn ensure_hint_script() -> Result<()> {
         "returnByValue": true,
         "awaitPromise": false
     });
-    let v2 = cdp_call("Runtime.evaluate", verify, CapabilityClass::RuntimeEvaluate)?;
+    let v2 = call("Runtime.evaluate", verify, CapabilityClass::RuntimeEvaluate)?;
     let ok = v2.get("result").and_then(|r| r.get("value")).and_then(|x| x.as_bool()).unwrap_or(false);
     if !ok {
         bail!("hint script failed to install window.__hyprfastHint");
@@ -61,7 +132,28 @@ fn ensure_hint_script() -> Result<()> {
 /// Scan DOM for hint-eligible elements and overlay labels.
 /// Returns compact list [{label, tag, role, name, rect, selector, text}]
 pub fn hint_snapshot() -> Result<Value> {
-    ensure_hint_script()?;
+    hint_snapshot_with_target(None)
+}
+
+/// Target-aware snapshot: spec can be index (1-based), targetId, or url/title substring.
+/// Routes Runtime.evaluate directly to the target's session (no focus needed) via target_id.
+pub fn hint_snapshot_with_target(target: Option<&str>) -> Result<Value> {
+    let tid_opt: Option<String> = if let Some(spec) = target {
+        let s = spec.trim();
+        if s.is_empty() { None } else {
+            let tid = resolve_target_id(s)?;
+            // Best-effort activate for UI visibility, but routing does not depend on it
+            let _ = cdp_call_with_target(
+                "Target.activateTarget",
+                json!({"targetId": tid}),
+                Some(&tid),
+                CapabilityClass::None,
+            );
+            let _ = cdp_call("Target.activateTarget", json!({"targetId": tid}), CapabilityClass::None);
+            Some(tid)
+        }
+    } else { None };
+    ensure_hint_script_with_target(tid_opt.as_deref())?;
     let expr = "JSON.stringify(window.__hyprfastHint.snapshot())";
     let params = json!({
         "expression": expr,
@@ -69,7 +161,11 @@ pub fn hint_snapshot() -> Result<Value> {
         "awaitPromise": false,
         "userGesture": true
     });
-    let v = cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?;
+    let v = if let Some(ref tid) = tid_opt {
+        cdp_call_with_target("Runtime.evaluate", params, Some(tid), CapabilityClass::RuntimeEvaluate)?
+    } else {
+        cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?
+    };
     if let Some(exc) = v.get("exceptionDetails") {
         bail!("hint snapshot exception: {}", exc);
     }
@@ -79,10 +175,36 @@ pub fn hint_snapshot() -> Result<Value> {
     Ok(json!({"hints": arr, "count": count, "via": "hint"}))
 }
 
+fn activate_if_target(target: Option<&str>) -> Result<()> {
+    if let Some(spec) = target {
+        let s = spec.trim();
+        if !s.is_empty() {
+            let tid = resolve_target_id(s)?;
+            let _ = cdp_call_with_target(
+                "Target.activateTarget",
+                json!({"targetId": tid}),
+                Some(&tid),
+                CapabilityClass::None,
+            );
+            let _ = cdp_call("Target.activateTarget", json!({"targetId": tid}), CapabilityClass::None);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    Ok(())
+}
+
 /// Click element by hint label.
 pub fn hint_click(label: &str) -> Result<Value> {
+    hint_click_with_target(label, None)
+}
+pub fn hint_click_with_target(label: &str, target: Option<&str>) -> Result<Value> {
     if label.is_empty() { bail!("hint_click needs label"); }
-    ensure_hint_script()?;
+    let tid_opt = target.and_then(|s| { let t=s.trim(); if t.is_empty() {None} else { resolve_target_id(t).ok() } });
+    // best-effort activate for visibility
+    if let Some(ref tid) = tid_opt {
+        let _ = cdp_call_with_target("Target.activateTarget", json!({"targetId": tid}), Some(tid), CapabilityClass::None);
+    }
+    ensure_hint_script_with_target(tid_opt.as_deref())?;
     let expr = format!("JSON.stringify(window.__hyprfastHint.click({:?}))", label);
     let params = json!({
         "expression": expr,
@@ -90,7 +212,11 @@ pub fn hint_click(label: &str) -> Result<Value> {
         "awaitPromise": false,
         "userGesture": true
     });
-    let v = cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?;
+    let v = if let Some(ref tid) = tid_opt {
+        cdp_call_with_target("Runtime.evaluate", params, Some(tid), CapabilityClass::RuntimeEvaluate)?
+    } else {
+        cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?
+    };
     if let Some(exc) = v.get("exceptionDetails") {
         bail!("hint click exception: {}", exc);
     }
@@ -104,8 +230,15 @@ pub fn hint_click(label: &str) -> Result<Value> {
 
 /// Focus element by hint label and type text.
 pub fn hint_type(label: &str, text: &str) -> Result<Value> {
+    hint_type_with_target(label, text, None)
+}
+pub fn hint_type_with_target(label: &str, text: &str, target: Option<&str>) -> Result<Value> {
     if label.is_empty() { bail!("hint_type needs label"); }
-    ensure_hint_script()?;
+    let tid_opt = target.and_then(|s| { let t=s.trim(); if t.is_empty() {None} else { resolve_target_id(t).ok() } });
+    if let Some(ref tid) = tid_opt {
+        let _ = cdp_call_with_target("Target.activateTarget", json!({"targetId": tid}), Some(tid), CapabilityClass::None);
+    }
+    ensure_hint_script_with_target(tid_opt.as_deref())?;
     let expr = format!("JSON.stringify(window.__hyprfastHint.focusAndType({:?}, {:?}))", label, text);
     let params = json!({
         "expression": expr,
@@ -113,7 +246,11 @@ pub fn hint_type(label: &str, text: &str) -> Result<Value> {
         "awaitPromise": false,
         "userGesture": true
     });
-    let v = cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?;
+    let v = if let Some(ref tid) = tid_opt {
+        cdp_call_with_target("Runtime.evaluate", params, Some(tid), CapabilityClass::RuntimeEvaluate)?
+    } else {
+        cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?
+    };
     if let Some(exc) = v.get("exceptionDetails") {
         bail!("hint type exception: {}", exc);
     }
@@ -290,13 +427,21 @@ pub fn try_vision_tier(instruction: &str, method: &str, type_text: &str, window:
 
 /// Clear hint overlay without new snapshot.
 pub fn hint_clear() -> Result<Value> {
-    ensure_hint_script()?;
+    hint_clear_with_target(None)
+}
+pub fn hint_clear_with_target(target: Option<&str>) -> Result<Value> {
+    let tid_opt = target.and_then(|s| { let t=s.trim(); if t.is_empty() {None} else { resolve_target_id(t).ok() } });
+    ensure_hint_script_with_target(tid_opt.as_deref())?;
     let params = json!({
         "expression": "JSON.stringify((window.__hyprfastHint.clear(), {cleared:true}))",
         "returnByValue": true,
         "awaitPromise": false
     });
-    let v = cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?;
+    let v = if let Some(ref tid) = tid_opt {
+        cdp_call_with_target("Runtime.evaluate", params, Some(tid), CapabilityClass::RuntimeEvaluate)?
+    } else {
+        cdp_call("Runtime.evaluate", params, CapabilityClass::RuntimeEvaluate)?
+    };
     let raw = v.get("result").and_then(|r| r.get("value")).and_then(|x| x.as_str()).unwrap_or("{}");
     let out: Value = serde_json::from_str(raw).unwrap_or(json!({"cleared": true}));
     Ok(out)
@@ -305,7 +450,16 @@ pub fn hint_clear() -> Result<Value> {
 /// Vimium-primary single action: snapshot once -> resolve label -> click/type.
 /// This is the fast path: no AX tree, no screenshot. Falls back to vision if hint empty.
 pub fn hint_act(instruction: &str, method: &str, type_text: &str, cfg: &crate::stagehand::StagehandConfig) -> Result<Value> {
-    let hints = hint_snapshot()?;
+    hint_act_with_target(instruction, method, type_text, cfg, None)
+}
+pub fn hint_act_with_target(
+    instruction: &str,
+    method: &str,
+    type_text: &str,
+    cfg: &crate::stagehand::StagehandConfig,
+    target: Option<&str>,
+) -> Result<Value> {
+    let hints = hint_snapshot_with_target(target)?;
     let count = hints.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     if count == 0 {
         // No DOM candidates -> vision last resort (keep screenshot+vision if nothing works)
@@ -315,9 +469,9 @@ pub fn hint_act(instruction: &str, method: &str, type_text: &str, cfg: &crate::s
         let is_type = matches!(method, "fill" | "type" | "type_text");
         let res = if is_type {
             let txt = if type_text.is_empty() { extract_target_hint(instruction) } else { type_text.to_string() };
-            hint_type(&label, &txt)?
+            hint_type_with_target(&label, &txt, target)?
         } else {
-            hint_click(&label)?
+            hint_click_with_target(&label, target)?
         };
         crate::stagehand::instrumentation::METRICS.record_tier("hint");
         return Ok(json!({"success": true, "tier": "hint", "label": label, "via": "hint_act", "result": res, "count": count}));
@@ -366,9 +520,16 @@ fn llm_hint_match_batch(instructions: &[String], hints_val: &Value, cfg: &crate:
 /// Vimium-primary parallel batch: one snapshot + one batched LLM call + parallel dispatches.
 /// Keeps screenshot+vision fallback per-step if hint cannot resolve.
 pub fn hint_batch(steps: &[Value], cfg: &crate::stagehand::StagehandConfig) -> Result<Value> {
+    hint_batch_with_target(steps, cfg, None)
+}
+pub fn hint_batch_with_target(
+    steps: &[Value],
+    cfg: &crate::stagehand::StagehandConfig,
+    target: Option<&str>,
+) -> Result<Value> {
     if steps.is_empty() { bail!("hint_batch needs at least 1 step"); }
     if steps.len() > 12 { bail!("hint_batch max 12 steps"); }
-    let hints = hint_snapshot()?;
+    let hints = hint_snapshot_with_target(target)?;
     let count = hints.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     if count == 0 {
         // No hints -> per-step vision fallback sequentially (vision needs screenshot per step)
@@ -412,6 +573,7 @@ pub fn hint_batch(steps: &[Value], cfg: &crate::stagehand::StagehandConfig) -> R
     }
     // Phase 3: parallel dispatch via std::thread::scope (CDP transport concurrent, I5 per-target serialization still via server queue)
     let hints_for_threads = &hints;
+    let target_owned = target.map(|s| s.to_string());
     let results: Vec<Value> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for i in 0..instrs.len() {
@@ -420,14 +582,15 @@ pub fn hint_batch(steps: &[Value], cfg: &crate::stagehand::StagehandConfig) -> R
             let method = methods[i].clone();
             let text = texts[i].clone();
             let hints_ref = hints_for_threads;
+            let t = target_owned.clone();
             handles.push(scope.spawn(move || {
                 if let Some(label) = label_opt {
                     let is_type = matches!(method.as_str(), "fill" | "type" | "type_text");
                     let res = if is_type {
                         let txt = if text.is_empty() { extract_target_hint(&instr) } else { text.clone() };
-                        hint_type(&label, &txt)
+                        hint_type_with_target(&label, &txt, t.as_deref())
                     } else {
-                        hint_click(&label)
+                        hint_click_with_target(&label, t.as_deref())
                     };
                     match res {
                         Ok(v) => {

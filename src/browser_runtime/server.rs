@@ -898,16 +898,26 @@ impl BrowserRuntimeServer {
                     "browser connection is dead".to_string(),
                 ));
             }
-            let session: Option<String> = session_id
-                .map(str::to_string)
-                .or_else(|| {
-                    if method.starts_with("Target.") || method.starts_with("Browser.") {
-                        None
-                    } else {
-                        rt.diagnostics().attached_session_ids.into_iter().next()
+            // Resolve session: explicit session_id -> target manager -> auto-attach -> first attached session
+            let mut sess_opt: Option<String> = session_id.map(|s| s.to_string());
+            if sess_opt.is_none() {
+                if let Some(tid) = target_id {
+                    if let Some(rec) = self.target_manager.get_target(tid) {
+                        if let Some(sid) = rec.session_id { sess_opt = Some(sid); }
                     }
-                });
-            return rt.call(session.as_deref(), method, params).await;
+                    if sess_opt.is_none() {
+                        if let Ok(v) = rt.call(None, "Target.attachToTarget", json!({"targetId": tid, "flatten": true})).await {
+                            if let Some(sid) = v.get("sessionId").and_then(|x| x.as_str()) {
+                                sess_opt = Some(sid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if sess_opt.is_none() && !(method.starts_with("Target.") || method.starts_with("Browser.")) {
+                sess_opt = rt.diagnostics().attached_session_ids.into_iter().next();
+            }
+            return rt.call(sess_opt.as_deref(), method, params).await;
         }
         let guard = self.runtime.lock().await;
         let Some(rt) = guard.as_ref().cloned() else {
@@ -921,16 +931,25 @@ impl BrowserRuntimeServer {
                 "browser connection is dead".to_string(),
             ));
         }
-        let session: Option<String> = session_id
-            .map(str::to_string)
-            .or_else(|| {
-                if method.starts_with("Target.") || method.starts_with("Browser.") {
-                    None
-                } else {
-                    rt.diagnostics().attached_session_ids.into_iter().next()
+        let mut sess_opt: Option<String> = session_id.map(|s| s.to_string());
+        if sess_opt.is_none() {
+            if let Some(tid) = target_id {
+                if let Some(rec) = self.target_manager.get_target(tid) {
+                    if let Some(sid) = rec.session_id { sess_opt = Some(sid); }
                 }
-            });
-        rt.call(session.as_deref(), method, params).await
+                if sess_opt.is_none() {
+                    if let Ok(v) = rt.call(None, "Target.attachToTarget", json!({"targetId": tid, "flatten": true})).await {
+                        if let Some(sid) = v.get("sessionId").and_then(|x| x.as_str()) {
+                            sess_opt = Some(sid.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if sess_opt.is_none() && !(method.starts_with("Target.") || method.starts_with("Browser.")) {
+            sess_opt = rt.diagnostics().attached_session_ids.into_iter().next();
+        }
+        rt.call(sess_opt.as_deref(), method, params).await
     }
 
     /// Begin shutdown exactly once: `* → Stopping`, wake the accept loop.
