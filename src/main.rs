@@ -10,12 +10,13 @@ mod session;
 mod task;
 mod cdp;
 mod browser;
-mod stagehand;
 mod ground;
 mod browser_runtime;
 mod devtools_mcp;
 mod hint;
 mod excalidraw;
+mod decider;
+mod perception;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
@@ -61,28 +62,6 @@ enum BrowserCmd {
     Wait { #[arg(default_value="1")] secs: f64 },
     /// Launch browser with remote-debugging-port (workspace optional)
     Open { url: String, #[arg(long)] workspace: Option<String> },
-}
-
-#[derive(Subcommand)]
-enum StagehandCmd {
-    /// LLM-driven action: "click the login button"
-    Act { instruction: String, #[arg(long)] model: Option<String>, #[arg(long)] cache: Option<bool> },
-    /// Discover actionable elements
-    Observe { instruction: Option<String>, #[arg(long)] model: Option<String> },
-    /// Extract structured data: instruction + optional JSON schema string
-    Extract { instruction: String, #[arg(long)] schema: Option<String>, #[arg(long)] model: Option<String> },
-    /// Autonomous agent loop
-    Agent { goal: String, #[arg(long, default_value="6")] max_steps: usize, #[arg(long)] model: Option<String> },
-    /// Hybrid snapshot (stagehand tree)
-    Snapshot,
-    /// Cache ops
-    Cache { action: String },
-    /// Metrics (act/observe/extract tokens)
-    Metrics,
-    /// Batch (experimentalBatch callbackSource)
-    Batch { callback_source: String, #[arg(long)] input: Option<String>, #[arg(long, default_value="30000")] timeout: u32 },
-    /// WebMCP list/invoke
-    Webmcp { action: String, #[arg(long)] tool: Option<String>, #[arg(long)] input: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -140,6 +119,74 @@ enum ExcalidrawCmd {
 }
 
 #[derive(Subcommand)]
+enum DeciderCmd {
+    /// Unified Decider-2B: single or multiple questions, options, image (file/b64/screenshot), context (covers decide, batch, choose, classify, detect)
+    Decide {
+        /// Single question or query (positional)
+        #[arg(value_name = "QUESTION")]
+        question: Option<String>,
+        /// Alternative explicit -q/--question flag
+        #[arg(long, short = 'q')]
+        q: Option<String>,
+        /// Options: comma-separated ("A, B, C") or JSON array ('["A", "B"]')
+        #[arg(long)]
+        options: Option<String>,
+        /// Multiple questions: JSON array of objects ([{"question": "...", "options": [...]}, ...])
+        #[arg(long)]
+        questions: Option<String>,
+        /// Context or state description
+        #[arg(long)]
+        context: Option<String>,
+        /// Image: file path (/tmp/shot.png), base64 string, or data URI
+        #[arg(long)]
+        image: Option<String>,
+        /// Auto-capture screenshot of desktop or browser
+        #[arg(long, default_value_t = false)]
+        screenshot: bool,
+        /// Target browser tab index/name or window
+        #[arg(long)]
+        target: Option<String>,
+        /// Sampling temperature
+        #[arg(long)]
+        temperature: Option<f32>,
+    },
+    /// Multiple questions same context/screenshot (or requests array for concurrent batch)
+    Batch { #[arg(long)] context: Option<String>, #[arg(long)] questions: Option<String>, #[arg(long)] requests: Option<String>, #[arg(long)] image: Option<String> },
+    /// Semantic target resolver: query -> DOM/AX/hints -> candidate filtering -> Decider if ambiguous
+    Find { query: String, #[arg(long)] target: Option<String>, #[arg(long)] use_vision: bool, #[arg(long)] image: Option<String> },
+    /// Choose: question + options[] up to 255, numeric IDs internally when visual candidates
+    Choose { question: String, #[arg(long)] options: String, #[arg(long)] context: Option<String>, #[arg(long)] image: Option<String>, #[arg(long)] target: Option<String>, #[arg(long)] use_vision: bool },
+    /// State classification from explicit options, image optional
+    Classify { question: String, #[arg(long)] options: String, #[arg(long)] image: Option<String>, #[arg(long)] context: Option<String> },
+    /// Presence/absence YES/NO/UNCERTAIN
+    Detect { query: String, #[arg(long)] context: Option<String>, #[arg(long)] image: Option<String>, #[arg(long)] use_vision: bool },
+    /// Which candidate/entity
+    Identify { query: String, #[arg(long)] candidates: Option<String>, #[arg(long)] target: Option<String>, #[arg(long)] use_vision: bool },
+    /// Visual target: description+image+candidate rects/metadata -> selected candidate ID/confidence/probs/rect
+    VisualTarget { description: String, #[arg(long)] candidates: String, #[arg(long)] image: Option<String>, #[arg(long)] target: Option<String> },
+    /// Verify (DOM first, Decider visual only when necessary)
+    Verify { query: String },
+    /// Verify element (candidate)
+    VerifyElement { #[arg(long)] candidate: Option<String>, #[arg(long)] selector: Option<String> },
+    /// Verify action succeeded
+    VerifyAction { query: String, #[arg(long)] expected: Option<String> },
+    /// Wait until predicate via DOM/AX polling + visual fallback
+    WaitUntil { query: String, #[arg(long, default_value="5000")] timeout_ms: u64, #[arg(long, default_value="200")] interval_ms: u64 },
+    /// Observe state: classify current UI state from explicit options
+    ObserveState { query: String, #[arg(long)] options: Option<String>, #[arg(long)] image: Option<String> },
+    /// Hint resolve: hint_snapshot -> Decider -> hint_click (single instruction)
+    HintResolve { instruction: String, #[arg(long)] target: Option<String>, #[arg(long)] vision: bool },
+    /// Hint resolve batch: multiple instructions same snapshot/screenshot
+    HintResolveBatch { #[arg(long)] instructions: String, #[arg(long)] target: Option<String>, #[arg(long)] vision: bool },
+    /// Key identify for visual/virtual keyboards
+    KeyIdentify { key: String, #[arg(long)] target: Option<String>, #[arg(long)] rect: Option<String>, #[arg(long)] vision: bool },
+    /// Composite: find + click
+    FindAndClick { query: String, #[arg(long)] target: Option<String>, #[arg(long)] use_vision: bool },
+    /// Composite: find + type
+    FindAndType { query: String, text: String, #[arg(long)] target: Option<String>, #[arg(long)] use_vision: bool },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Instant desktop snapshot (no screenshot, <5ms) — windows, workspaces, monitors
     Desktop,
@@ -176,8 +223,6 @@ enum Commands {
     /// Internal: daemon serve loop (spawned detached by `browser-runtime start`)
     #[command(hide = true)]
     BrowserRuntimeInternalServe,
-    /// Stagehand LLM-driven browser automation: act/observe/extract/agent (requires OPENAI_API_KEY)
-    Stagehand { #[command(subcommand)] cmd: StagehandCmd },
     /// Fast visual grounding: screenshot + Gemini Flash -> {x,y}
     Ground { instruction: String, #[arg(long)] window: Option<String>, #[arg(long)] region: Option<String> },
     /// Fused ground+click/type in one call (Astra-like, no N LLM turns)
@@ -198,10 +243,42 @@ enum Commands {
     HintClear { #[arg(long, help="Target tab: 1-based index, targetId, or url/title substring")] target: Option<String> },
     /// Excalidraw automation: open/scene/draw/diagram/export/view/fit
     Excalidraw { #[command(subcommand)] cmd: ExcalidrawCmd },
+    /// Semantic perception + Decider-2B (vision 10, text 255, reuse perception resolver)
+    Decider { #[command(subcommand)] cmd: DeciderCmd },
+    /// Unified Decider-2B: single or multiple questions, options, image (file/b64/screenshot), context (covers decide, batch, choose, classify, detect)
+    Decide {
+        /// Single question or query (positional)
+        #[arg(value_name = "QUESTION")]
+        question: Option<String>,
+        /// Alternative explicit -q/--question flag
+        #[arg(long, short = 'q')]
+        q: Option<String>,
+        /// Options: comma-separated ("A, B, C") or JSON array ('["A", "B"]')
+        #[arg(long)]
+        options: Option<String>,
+        /// Multiple questions: JSON array of objects ([{"question": "...", "options": [...]}, ...])
+        #[arg(long)]
+        questions: Option<String>,
+        /// Context or state description
+        #[arg(long)]
+        context: Option<String>,
+        /// Image: file path (/tmp/shot.png), base64 string, or data URI
+        #[arg(long)]
+        image: Option<String>,
+        /// Auto-capture screenshot of desktop or browser
+        #[arg(long, default_value_t = false)]
+        screenshot: bool,
+        /// Target browser tab index/name or window
+        #[arg(long)]
+        target: Option<String>,
+        /// Sampling temperature
+        #[arg(long)]
+        temperature: Option<f32>,
+    },
     /// Laya Pass-1: list 8 tool categories (category_name + description)
     Categories,
     /// Laya Pass-2: show category + its commands with descriptions
-    Category { #[arg(help="Category name: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw")] category: String },
+    Category { #[arg(help="Category name: core-desktop|perceive|native-act|browser-act|fast-ground|task-memory|draw|perception")] category: String },
     /// Run as MCP server (stdio JSON-RPC) — exposes all tools to LLM clients (default when no command given)
     Mcp,
 }
@@ -218,6 +295,124 @@ fn ensure_browser_args(cmd: &str) -> String {
     cmd.to_string()
 }
 
+// Chromium is single-instance per profile: launching against the default profile
+// forwards the URL to the running browser and exits, so the debugging port never
+// opens. Always use an isolated --user-data-dir and verify readiness by polling.
+
+// Mirrors the isVisible() rule in assets/hint.js: an element counts as actionable
+// when it is laid out, styled visible and inside the viewport. `load`/readyState is
+// not a usable gate — a cold YouTube profile flips readyState to "complete" seconds
+// before it paints anything clickable.
+const PAGE_INTERACTIVE_JS: &str = r#"(function(){
+  var sel = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"], [onclick], [contenteditable], [draggable="true"], summary, [tabindex]:not([tabindex="-1"])';
+  var els = document.querySelectorAll(sel);
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i], r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    var s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0' || s.pointerEvents === 'none') continue;
+    if (r.bottom < 0 || r.right < 0 || r.top > window.innerHeight || r.left > window.innerWidth) continue;
+    if (el.hidden) continue;
+    return true;
+  }
+  return false;
+})()"#;
+
+fn env_millis(var_name: &str, default_ms: u64) -> u64 {
+    std::env::var(var_name).ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms)
+}
+
+/// Bounded poll for "the page a user just asked us to open is actionable".
+/// Requires a run of consecutive hits because heavy pages (YouTube boots, then
+/// reloads itself with `&themeRefresh=1`) go interactive and blank out again a
+/// moment later; returning on the first hit hands the caller a half-loaded DOM.
+/// Returns elapsed ms; a page that never settles is reported, not fatal.
+fn wait_page_interactive(budget_ms: u64) -> (bool, u64) {
+    const STABLE_POLLS: u32 = 3;
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(budget_ms);
+    let mut streak = 0;
+    loop {
+        if cdp::evaluate(PAGE_INTERACTIVE_JS, false).ok().and_then(|v| v.as_bool()) == Some(true) {
+            streak += 1;
+            if streak >= STABLE_POLLS { return (true, started.elapsed().as_millis() as u64); }
+        } else {
+            streak = 0;
+        }
+        if std::time::Instant::now() >= deadline { return (false, started.elapsed().as_millis() as u64); }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+fn browser_open_url(url: &str, workspace: &str) -> Result<Value> {
+    if url.is_empty() { anyhow::bail!("browser_open needs url"); }
+    if cdp::probe() {
+        let navigated = browser::navigate(url, None).is_ok();
+        let (interactive, waited_ms) = wait_page_interactive(env_millis("HYPRFAST_PAGE_READY_TIMEOUT_MS", 2500));
+        return Ok(serde_json::json!({
+            "launched": url,
+            "browser": "reused",
+            "cdp_base_url": cdp::base_url(),
+            "navigated": navigated,
+            "interactive": interactive,
+            "page_ready_ms": waited_ms,
+            "cdp": cdp::endpoint_version().unwrap_or(serde_json::json!({})),
+            "target": open_target(url),
+        }));
+    }
+    let port = cdp::port();
+    let profile = std::env::temp_dir().join(format!("hyprfast-brave-{}", port));
+    let _ = std::fs::create_dir_all(&profile);
+    let cmd = format!(
+        "brave --remote-debugging-port={} --force-renderer-accessibility --remote-allow-origins=* --no-first-run --no-default-browser-check --user-data-dir={} --new-window {}",
+        port, profile.display(), url
+    );
+    let rule = if workspace.is_empty() { String::new() } else { format!("[workspace {} silent] ", workspace) };
+    let started = std::time::Instant::now();
+    hypr::dispatch("exec", &format!("{}{}", rule, cmd))?;
+    let timeout_ms = env_millis("HYPRFAST_CDP_READY_TIMEOUT_MS", 8000);
+    let deadline = started + std::time::Duration::from_millis(timeout_ms);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if cdp::probe() { ready = true; break; }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if !ready {
+        anyhow::bail!(
+            "browser_open: no CDP endpoint at {}/json/version {}ms after launching brave with --user-data-dir={} (port {}). \
+             A Brave already running on the default profile swallows the launch request unless it was started with --remote-debugging-port; \
+             retry, or launch it yourself with the same isolated profile.",
+            cdp::base_url(), timeout_ms, profile.display(), port
+        );
+    }
+    let cdp_ready_ms = started.elapsed().as_millis() as u64;
+    let (interactive, page_ms) = wait_page_interactive(env_millis("HYPRFAST_PAGE_READY_TIMEOUT_MS", 20000));
+    Ok(serde_json::json!({
+        "launched": url,
+        "browser": "launched",
+        "cdp_base_url": cdp::base_url(),
+        "port": port,
+        "user_data_dir": profile.display().to_string(),
+        "cdp_ready_ms": cdp_ready_ms,
+        "interactive": interactive,
+        "page_ready_ms": page_ms,
+        "cdp": cdp::endpoint_version().unwrap_or(serde_json::json!({})),
+        "target": open_target(url),
+    }))
+}
+
+fn open_target(url: &str) -> Value {
+    let pages = match cdp::targets_http() {
+        Ok(p) => p,
+        Err(_) => return Value::Null,
+    };
+    pages.iter().find(|t| t.typ == "page" && t.url.starts_with(url))
+        .or_else(|| pages.iter().rev().find(|t| t.typ == "page" && t.url != "about:blank"))
+        .or_else(|| pages.iter().rev().find(|t| t.typ == "page"))
+        .map(|t| serde_json::json!({"id": t.id, "url": t.url, "title": t.title}))
+        .unwrap_or(Value::Null)
+}
+
 // --- Laya 2-pass helpers (README-laya.md) ---
 
 fn laya_categories_value() -> serde_json::Value {
@@ -225,13 +420,13 @@ fn laya_categories_value() -> serde_json::Value {
         "total": 8,
         "categories": [
             {"category_name": "core-desktop", "description": "Hyprland desktop — snapshot, hypr, launch, binds, wait_for"},
-            {"category_name": "perceive", "description": "Perceive — read-only: ui, screenshot, browser_snapshot, tabs, console, context_pages, session_status"},
+            {"category_name": "perceive", "description": "Perceive — read-only: ui, screenshot, browser_snapshot, tabs, console, session_status"},
             {"category_name": "native-act", "description": "Native act — click_ui, pointer, keyboard"},
             {"category_name": "browser-act", "description": "Browser act — deterministic CDP: navigate, click, type, eval, etc."},
-            {"category_name": "smart-llm", "description": "Smart LLM — stagehand act/observe/extract/agent"},
             {"category_name": "fast-ground", "description": "Fast ground — hint_* + ground/act_fast (vision fallback for canvas/WebGL)"},
             {"category_name": "task-memory", "description": "Task memory — task_* + clear_screenshots"},
-            {"category_name": "draw", "description": "Draw — excalidraw whiteboard / architecture diagrams"}
+            {"category_name": "draw", "description": "Draw — excalidraw whiteboard / architecture diagrams"},
+            {"category_name": "perception", "description": "Perception — Decider-2B semantic: decide/decider_batch/find/choose/classify/detect/identify/visual_target/verify/* + hint_resolve (vision 10, text 255)"}
         ]
     })
 }
@@ -253,15 +448,14 @@ fn laya_category_value(name: &str) -> anyhow::Result<serde_json::Value> {
         }),
         "perceive" => serde_json::json!({
             "category_name": "perceive",
-            "description": "Perceive — read-only: ui, screenshot, browser_snapshot, tabs, console, context_pages, session_status",
-            "total_commands": 7,
+            "description": "Perceive — read-only: ui, screenshot, browser_snapshot, tabs, console, session_status",
+            "total_commands": 6,
             "commands": [
                 {"command_name": "ui", "description": "AT-SPI accessible tree (fast, no screenshot)"},
                 {"command_name": "screenshot", "description": "Capture via grim: window, region, or monitor. Returns file path + meta"},
                 {"command_name": "browser_snapshot", "description": "CDP: capture accessibility snapshot (AX tree via Accessibility.getFullAXTree)"},
                 {"command_name": "browser_tabs", "description": "CDP: list browser tabs/targets (GET /json)"},
                 {"command_name": "browser_console", "description": "CDP: get console logs (Console.enable)"},
-                {"command_name": "context_pages", "description": "Stagehand context.pages: list pages via CDP Target.getTargets"},
                 {"command_name": "session_status", "description": "Show screenshot session status (tracked files, bytes)"}
             ]
         }),
@@ -278,7 +472,7 @@ fn laya_category_value(name: &str) -> anyhow::Result<serde_json::Value> {
         "browser-act" | "browser" => serde_json::json!({
             "category_name": "browser-act",
             "description": "Browser act — deterministic CDP: navigate, click, type, eval, etc.",
-            "total_commands": 16,
+            "total_commands": 13,
             "commands": [
                 {"command_name": "browser_navigate", "description": "CDP: navigate browser tab to URL (auto-discovers ws://9222)"},
                 {"command_name": "browser_open", "description": "Hypr+CDP: launch Brave with --remote-debugging-port=9222"},
@@ -292,26 +486,7 @@ fn laya_category_value(name: &str) -> anyhow::Result<serde_json::Value> {
                 {"command_name": "browser_wait", "description": "CDP: wait N seconds (browser)"},
                 {"command_name": "browser_evaluate", "description": "CDP: evaluate JavaScript in page (Runtime.evaluate)"},
                 {"command_name": "browser_screenshot", "description": "CDP: capture browser tab screenshot via Page.captureScreenshot (PNG, no grim)"},
-                {"command_name": "browser_execute_plan", "description": "Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract"},
-                {"command_name": "clipboard_write", "description": "Clipboard write via CDP"},
-                {"command_name": "clipboard_read", "description": "Clipboard read via CDP"},
-                {"command_name": "cookies_set", "description": "Set cookies via Storage.setCookies"}
-            ]
-        }),
-        "smart-llm" | "smart" | "llm" | "stagehand" => serde_json::json!({
-            "category_name": "smart-llm",
-            "description": "Smart LLM — stagehand act/observe/extract/agent",
-            "total_commands": 9,
-            "commands": [
-                {"command_name": "stagehand_act", "description": "Stagehand act: natural language browser action (LLM → CDP)"},
-                {"command_name": "stagehand_observe", "description": "Stagehand observe: discover actionable elements matching instruction"},
-                {"command_name": "stagehand_extract", "description": "Stagehand extract: LLM extracts structured data from page"},
-                {"command_name": "stagehand_agent", "description": "Stagehand agent: autonomous loop act/extract until goal complete"},
-                {"command_name": "stagehand_snapshot", "description": "Stagehand hybrid snapshot: Accessibility.getFullAXTree + xpathMap"},
-                {"command_name": "stagehand_cache", "description": "Stagehand cache: status/clear for act cache"},
-                {"command_name": "stagehand_metrics", "description": "Stagehand metrics: aggregate token usage for act/observe/extract"},
-                {"command_name": "stagehand_batch", "description": "Stagehand experimentalBatch: run serialized callbackSource in browser context"},
-                {"command_name": "stagehand_webmcp", "description": "Stagehand WebMCP: list_tools/invoke_tool via page __webmcp"}
+                {"command_name": "browser_execute_plan", "description": "Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract"}
             ]
         }),
         "fast-ground" | "fast" | "ground" | "hint" => serde_json::json!({
@@ -362,9 +537,81 @@ fn laya_category_value(name: &str) -> anyhow::Result<serde_json::Value> {
                 {"command_name": "excalidraw_fit", "description": "Excalidraw: center viewport on content (zoom to fit)"}
             ]
         }),
-        _ => anyhow::bail!("unknown category '{key}': use one of core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw (see `hyprfast categories`)"),
+        "perception" | "semantic" | "decider" => serde_json::json!({
+            "category_name": "perception",
+            "description": "Perception — Decider-2B semantic: decide/decider_batch/find/choose/classify/detect/identify/visual_target/verify/* + hint_resolve (vision 10, text 255)",
+            "total_commands": 20,
+            "commands": [
+                {"command_name": "decide", "description": "Unified Decider-2B: single/multiple questions, options, image (file/b64/screenshot), context (covers decide, batch, choose, classify, detect)"},
+                {"command_name": "decider_batch", "description": "Multiple questions same context/screenshot (or requests[] for concurrent batch, bounded 4)"},
+                {"command_name": "find", "description": "Semantic target resolver: query -> DOM/AX/hints -> candidate filtering -> Decider if ambiguous -> resolved candidate metadata"},
+                {"command_name": "choose", "description": "Choose: question+options[] up to 255, numeric IDs internally when visual candidates, return selected + confidence + probs + runner_up/margin"},
+                {"command_name": "classify", "description": "State classification from explicit options, image optional"},
+                {"command_name": "detect", "description": "Presence/absence YES/NO/UNCERTAIN"},
+                {"command_name": "identify", "description": "Which candidate/entity — identify among candidates"},
+                {"command_name": "visual_target", "description": "Visual target: description+image+candidate rects/metadata -> selected candidate ID/confidence/probs/rect (vision 10 budget)"},
+                {"command_name": "verify", "description": "Verify (DOM first, Decider visual only when necessary) -> success/failure/uncertain + confidence"},
+                {"command_name": "verify_element", "description": "Verify element (candidate/selector) present/visible"},
+                {"command_name": "verify_action", "description": "Verify action succeeded (query + expected text)"},
+                {"command_name": "wait_until", "description": "Wait until predicate via DOM/AX polling + visual fallback, timeout/interval"},
+                {"command_name": "observe_state", "description": "Observe state: classify current UI state from explicit options"},
+                {"command_name": "hint_resolve", "description": "Hint resolve: hint_snapshot -> Decider -> hint_click (single instruction, target aware, fallback deterministic)"},
+                {"command_name": "hint_resolve_batch", "description": "Hint resolve batch: multiple instructions same snapshot/screenshot, batched Decider (max 12)"},
+                {"command_name": "key_identify", "description": "Key identify for visual/virtual keyboards (same pipeline, keyboard candidates)"},
+                {"command_name": "find_and_click", "description": "Composite: find + click (semantic find then hint/browser click)"},
+                {"command_name": "find_and_type", "description": "Composite: find + type (semantic find then hint/browser type)"},
+                {"command_name": "decider_metrics", "description": "Decider metrics snapshot"},
+                {"command_name": "decider_health", "description": "Decider health check"}
+            ]
+        }),
+        _ => anyhow::bail!("unknown category '{key}': use one of core-desktop|perceive|native-act|browser-act|fast-ground|task-memory|draw|perception (see `hyprfast categories`)"),
     };
     Ok(v)
+}
+
+fn build_decide_args(
+    question: Option<String>,
+    q_flag: Option<String>,
+    options: Option<String>,
+    questions: Option<String>,
+    context: Option<String>,
+    image: Option<String>,
+    screenshot: bool,
+    target: Option<String>,
+    temperature: Option<f32>,
+) -> Value {
+    let mut args = serde_json::json!({});
+    if let Some(c) = context { args["context"] = Value::String(c); }
+    if let Some(img) = image { args["image"] = Value::String(img); }
+    if screenshot { args["screenshot"] = Value::Bool(true); }
+    if let Some(t) = target { args["target"] = Value::String(t); }
+    if let Some(temp) = temperature { args["temperature"] = serde_json::json!(temp); }
+
+    let q_effective = question.or(q_flag);
+
+    if let Some(qs_str) = questions {
+        let trimmed = qs_str.trim();
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            args["questions"] = v;
+        } else {
+            args["questions"] = Value::String(qs_str);
+        }
+    }
+
+    if let Some(q) = q_effective {
+        args["question"] = Value::String(q);
+    }
+
+    if let Some(opts) = options {
+        let trimmed = opts.trim();
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            args["options"] = v;
+        } else {
+            args["options"] = Value::String(opts);
+        }
+    }
+
+    args
 }
 
 fn main() -> Result<()> {
@@ -573,47 +820,7 @@ fn main() -> Result<()> {
                 BrowserCmd::Console => browser::console_logs()?,
                 BrowserCmd::Wait { secs } => browser::wait(secs)?,
                 BrowserCmd::Open { url, workspace } => {
-                    let cmd = format!("brave --remote-debugging-port=9222 --force-renderer-accessibility --new-window {}", url);
-                    let rule = workspace.map(|w| format!("[workspace {} silent] ", w)).unwrap_or_default();
-                    hypr::dispatch("exec", &format!("{}{}", rule, cmd))?;
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-                    serde_json::json!({"launched": url, "cdp": cdp::version().unwrap_or(serde_json::json!({}))})
-                },
-            };
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
-        Some(Commands::Stagehand { cmd }) => {
-            let cfg = stagehand_cfg_from_args(&cmd);
-            let res = match cmd {
-                StagehandCmd::Act { instruction, .. } => stagehand::act::act(&instruction, &cfg)?,
-                StagehandCmd::Observe { instruction, .. } => stagehand::observe::observe(instruction.as_deref(), &cfg)?,
-                StagehandCmd::Extract { instruction, schema, .. } => {
-                    let sch = schema.as_deref().and_then(|s| serde_json::from_str(s).ok());
-                    stagehand::extract::extract(&instruction, sch.as_ref(), &cfg)?
-                },
-                StagehandCmd::Agent { goal, max_steps, .. } => stagehand::agent::execute(&goal, &cfg, max_steps)?,
-                StagehandCmd::Snapshot => {
-                    let snap = stagehand::snapshot::capture_hybrid()?;
-                    serde_json::json!({"combined_tree": snap.combined_tree, "xpath_map": snap.combined_xpath_map, "via": snap.via, "raw_nodes": snap.raw_ax_nodes})
-                },
-                StagehandCmd::Cache { action } => match action.as_str() {
-                    "clear" => stagehand::cache::clear_cache()?,
-                    "status" => stagehand::cache::cache_status(),
-                    _ => stagehand::cache::cache_status(),
-                },
-                StagehandCmd::Metrics => stagehand::instrumentation::METRICS.snapshot(),
-                StagehandCmd::Batch { callback_source, input, timeout } => {
-                    let v = input.as_deref().and_then(|s| serde_json::from_str(s).ok());
-                    stagehand::batch::experimental_batch(&callback_source, v, timeout)?
-                },
-                StagehandCmd::Webmcp { action, tool, input } => match action.as_str() {
-                    "list" => serde_json::json!({"tools": stagehand::webmcp::list_tools("")?}),
-                    "invoke" => {
-                        let t = tool.clone().unwrap_or_default();
-                        let iv: serde_json::Value = input.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(serde_json::json!({}));
-                        stagehand::webmcp::invoke_tool("", &t, iv)?
-                    },
-                    _ => serde_json::json!({"error": "webmcp action must be list|invoke"}),
+                    browser_open_url(&url, workspace.as_deref().unwrap_or(""))?
                 },
             };
             println!("{}", serde_json::to_string_pretty(&res)?);
@@ -644,15 +851,13 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Some(Commands::HintAct { instruction, action, text, target }) => {
-            let cfg = stagehand::StagehandConfig::from_env();
-            let v = hint::hint_act_with_target(&instruction, &action, &text, &cfg, target.as_deref())?;
+            let v = hint::hint_act_with_target(&instruction, &action, &text, target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Some(Commands::HintBatch { steps, target }) => {
             let v: Value = serde_json::from_str(&steps).unwrap_or(Value::Null);
             let arr = if let Some(a) = v.as_array() { a.clone() } else if let Some(o) = v.get("steps").and_then(|x| x.as_array()) { o.clone() } else { vec![v] };
-            let cfg = stagehand::StagehandConfig::from_env();
-            let out = hint::hint_batch_with_target(&arr.iter().cloned().collect::<Vec<_>>(), &cfg, target.as_deref())?;
+            let out = hint::hint_batch_with_target(&arr.iter().cloned().collect::<Vec<_>>(), target.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Some(Commands::HintClear { target }) => {
@@ -698,6 +903,119 @@ fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
+        Some(Commands::Decide { question, q, options, questions, context, image, screenshot, target, temperature }) => {
+            let args = build_decide_args(question, q, options, questions, context, image, screenshot, target, temperature);
+            let res = decider::tools::decide(args)?;
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+        Some(Commands::Decider { cmd }) => {
+            let res = match cmd {
+                DeciderCmd::Decide { question, q, options, questions, context, image, screenshot, target, temperature } => {
+                    let args = build_decide_args(question, q, options, questions, context, image, screenshot, target, temperature);
+                    decider::tools::decide(args)?
+                },
+                DeciderCmd::Batch { context, questions, requests, image } => {
+                    let mut args = Value::Null;
+                    if let Some(reqs) = requests {
+                        let v: Value = serde_json::from_str(&reqs).unwrap_or(Value::Null);
+                        args = serde_json::json!({"requests": v});
+                    } else if let Some(qs) = questions {
+                        let v: Value = serde_json::from_str(&qs).unwrap_or(Value::Null);
+                        let ctx = context.unwrap_or_default();
+                        args = serde_json::json!({"context": ctx, "questions": v});
+                        if let Some(img) = image { args["image"] = Value::String(img); }
+                    } else {
+                        anyhow::bail!("decider batch needs --questions or --requests JSON");
+                    }
+                    decider::tools::decider_batch(args)?
+                },
+                DeciderCmd::Find { query, target, use_vision, image } => {
+                    let mut args = serde_json::json!({"query": query, "use_vision": use_vision});
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    if let Some(img) = image { args["image"] = Value::String(img); }
+                    decider::tools::find(args)?
+                },
+                DeciderCmd::Choose { question, options, context, image, target, use_vision } => {
+                    let opts: Value = serde_json::from_str(&options).unwrap_or(Value::Array(vec![]));
+                    let mut args = serde_json::json!({"question": question, "options": opts, "use_vision": use_vision});
+                    if let Some(c) = context { args["context"] = Value::String(c); }
+                    if let Some(img) = image { args["image"] = Value::String(img); }
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    decider::tools::choose(args)?
+                },
+                DeciderCmd::Classify { question, options, image, context } => {
+                    let opts: Value = serde_json::from_str(&options).unwrap_or(Value::Array(vec![]));
+                    let mut args = serde_json::json!({"question": question, "options": opts});
+                    if let Some(img) = image { args["image"] = Value::String(img); }
+                    if let Some(c) = context { args["context"] = Value::String(c); }
+                    decider::tools::classify(args)?
+                },
+                DeciderCmd::Detect { query, context, image, use_vision } => {
+                    let mut args = serde_json::json!({"query": query, "use_vision": use_vision});
+                    if let Some(c) = context { args["context"] = Value::String(c); }
+                    if let Some(img) = image { args["image"] = Value::String(img); }
+                    decider::tools::detect(args)?
+                },
+                DeciderCmd::Identify { query, candidates, target, use_vision } => {
+                    let mut args = serde_json::json!({"query": query, "use_vision": use_vision});
+                    if let Some(c) = candidates { let v: Value = serde_json::from_str(&c).unwrap_or(Value::Null); args["candidates"] = v; }
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    decider::tools::identify(args)?
+                },
+                DeciderCmd::VisualTarget { description, candidates, image, target } => {
+                    let cands: Value = serde_json::from_str(&candidates).unwrap_or(Value::Null);
+                    let mut args = serde_json::json!({"description": description, "candidates": cands});
+                    if let Some(img) = image { args["image"] = Value::String(img); }
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    decider::tools::visual_target(args)?
+                },
+                DeciderCmd::Verify { query } => decider::tools::verify(serde_json::json!({"query": query}))?,
+                DeciderCmd::VerifyElement { candidate, selector } => {
+                    let mut args = serde_json::json!({});
+                    if let Some(c) = candidate { let v: Value = serde_json::from_str(&c).unwrap_or(Value::Null); args["candidate"] = v; }
+                    if let Some(s) = selector { args["selector"] = Value::String(s); }
+                    decider::tools::verify_element(args)?
+                },
+                DeciderCmd::VerifyAction { query, expected } => {
+                    let mut args = serde_json::json!({"query": query});
+                    if let Some(e) = expected { args["expected"] = Value::String(e); }
+                    decider::tools::verify_action(args)?
+                },
+                DeciderCmd::WaitUntil { query, timeout_ms, interval_ms } => decider::tools::wait_until(serde_json::json!({"query": query, "timeout_ms": timeout_ms, "interval_ms": interval_ms}))?,
+                DeciderCmd::ObserveState { query, options, image } => {
+                    let mut args = serde_json::json!({"query": query});
+                    if let Some(o) = options { let v: Value = serde_json::from_str(&o).unwrap_or(Value::Null); args["options"] = v; }
+                    if let Some(img) = image { args["image"] = Value::String(img); }
+                    decider::tools::observe_state(args)?
+                },
+                DeciderCmd::HintResolve { instruction, target, vision } => decider::tools::hint_resolve(serde_json::json!({"instruction": instruction, "target": target, "use_vision": vision}))?,
+                DeciderCmd::HintResolveBatch { instructions, target, vision } => {
+                    let v: Value = serde_json::from_str(&instructions).unwrap_or(Value::Null);
+                    let arr = if let Some(a)=v.as_array() { a.clone() } else { vec![v] };
+                    let instrs: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                    let mut args = serde_json::json!({"instructions": instrs, "use_vision": vision});
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    decider::tools::hint_resolve_batch(args)?
+                },
+                DeciderCmd::KeyIdentify { key, target, rect, vision } => {
+                    let mut args = serde_json::json!({"key": key, "use_vision": vision});
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    if let Some(r) = rect { let v: Value = serde_json::from_str(&r).unwrap_or(Value::Null); args["rect"] = v; }
+                    decider::tools::key_identify(args)?
+                },
+                DeciderCmd::FindAndClick { query, target, use_vision } => {
+                    let mut args = serde_json::json!({"query": query, "use_vision": use_vision});
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    decider::tools::find_and_click(args)?
+                },
+                DeciderCmd::FindAndType { query, text, target, use_vision } => {
+                    let mut args = serde_json::json!({"query": query, "text": text, "use_vision": use_vision});
+                    if let Some(t) = target { args["target"] = Value::String(t); }
+                    decider::tools::find_and_type(args)?
+                },
+            };
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
         Some(Commands::Categories) => {
             println!("{}", serde_json::to_string_pretty(&laya_categories_value())?);
         }
@@ -708,23 +1026,6 @@ fn main() -> Result<()> {
         Some(Commands::Mcp) | None => { run_mcp()?; }
     }
     Ok(())
-}
-
-fn stagehand_cfg_from_args(cmd: &StagehandCmd) -> stagehand::StagehandConfig {
-    let mut cfg = stagehand::StagehandConfig::from_env();
-    let model_override = match cmd {
-        StagehandCmd::Act { model, .. } => model.as_deref(),
-        StagehandCmd::Observe { model, .. } => model.as_deref(),
-        StagehandCmd::Extract { model, .. } => model.as_deref(),
-        StagehandCmd::Agent { model, .. } => model.as_deref(),
-        _ => None,
-    };
-    if let Some(m) = model_override { cfg.model_name = m.to_string(); }
-    // allow OPENAI_API_KEY override via env already; also check STAGEHAND_API_KEY
-    if cfg.api_key.is_empty() {
-        cfg.api_key = std::env::var("STAGEHAND_API_KEY").unwrap_or_default();
-    }
-    cfg
 }
 
 fn run_mcp() -> Result<()> {
@@ -767,43 +1068,44 @@ fn run_mcp() -> Result<()> {
         {"name":"browser_go_back","description":"CDP: go back (history.back)","inputSchema":{"type":"object","properties":{}}},
         {"name":"browser_go_forward","description":"CDP: go forward (history.forward)","inputSchema":{"type":"object","properties":{}}},
         {"name":"browser_open","description":"Hypr+CDP: launch Brave with --remote-debugging-port=9222 on workspace and navigate","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"workspace":{"type":"string"}},"required":["url"]}},
-        // Stagehand port (Rust) — LLM-driven primitives from browserbase/stagehand
-        {"name":"stagehand_act","description":"Stagehand act: natural language browser action (LLM → CDP). instruction like 'click login' . Uses hybrid AX tree + LLM + self-heal. Requires OPENAI_API_KEY / STAGEHAND_MODEL env","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"Natural language action, e.g. 'click the login button'"},"model":{"type":"string","description":"optional model override like openai/gpt-4o-mini"},"useCache":{"type":"boolean"}},"required":["instruction"]}},
-        {"name":"stagehand_observe","description":"Stagehand observe: discover actionable elements matching instruction. Returns [{elementId, description, method, arguments, xpath}]","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"e.g. 'find all submit buttons' (optional, defaults to all)"},"model":{"type":"string"}},"required":[]}},
-        {"name":"stagehand_extract","description":"Stagehand extract: LLM extracts structured data from page. instruction + optional JSON schema (as string). Returns {data}","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"e.g. 'extract title and price'"},"schema":{"type":"string","description":"Optional JSON schema string (zod-like), e.g. '{\"title\":\"string\",\"price\":\"number\"}'"},"model":{"type":"string"}},"required":["instruction"]}},
-        {"name":"stagehand_agent","description":"Stagehand agent: autonomous loop act/extract until goal complete. goal + max_steps","inputSchema":{"type":"object","properties":{"goal":{"type":"string","description":"Natural language goal e.g. 'book a flight'"},"max_steps":{"type":"integer","default":8},"model":{"type":"string"}},"required":["goal"]}},
-        {"name":"stagehand_snapshot","description":"Stagehand hybrid snapshot: Accessibility.getFullAXTree + xpathMap + trimmed tree (same as Stagehand captureHybridSnapshot)","inputSchema":{"type":"object","properties":{}}},
-        {"name":"stagehand_cache","description":"Stagehand cache: status/clear for act cache at ~/.cache/hyprfast/stagehand-cache.json","inputSchema":{"type":"object","properties":{"action":{"type":"string","description":"status|clear"}},"required":[]}},
-        {"name":"stagehand_metrics","description":"Stagehand metrics: aggregate token usage for act/observe/extract","inputSchema":{"type":"object","properties":{}}},
-        {"name":"stagehand_batch","description":"Stagehand experimentalBatch: run serialized callbackSource in browser context","inputSchema":{"type":"object","properties":{"callbackSource":{"type":"string"},"input":{"type":"object"},"timeout":{"type":"integer"}},"required":["callbackSource"]}},
-        {"name":"stagehand_webmcp","description":"Stagehand WebMCP: list_tools/invoke_tool via page __webmcp","inputSchema":{"type":"object","properties":{"action":{"type":"string","description":"list|invoke"},"tool":{"type":"string"},"input":{"type":"object"}},"required":["action"]}},
-        {"name":"context_pages","description":"Stagehand context.pages: list pages via CDP Target.getTargets","inputSchema":{"type":"object","properties":{}}},
-        {"name":"context_cookies","description":"Stagehand context.cookies: get cookies","inputSchema":{"type":"object","properties":{}}},
-        {"name":"cookies_set","description":"Set cookies via Storage.setCookies","inputSchema":{"type":"object","properties":{"cookies":{"type":"array"}}}},
-        {"name":"clipboard_write","description":"Clipboard write via CDP","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
-        {"name":"clipboard_read","description":"Clipboard read via CDP","inputSchema":{"type":"object","properties":{}}},
-        {"name":"ground","description":"Fast visual grounding: screenshot + Gemini Flash -> {x,y} global coords. Works on canvas/draw/color-pickers where AX has no tree.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"window":{"type":"string"},"region":{"type":"string"}},"required":["instruction"]}},
-        {"name":"act_fast","description":"Fused ground+click/type/key in ONE call (Astra-like). instruction + action click|type|key + text. No snapshot loop.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string"},"text":{"type":"string"},"window":{"type":"string"}},"required":["instruction"]}},
-        {"name":"act_batch","description":"Batch fused steps [{instruction,action,text}] in one MCP call. Max 12 steps.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"}},"required":["steps"]}},
-        {"name":"browser_execute_plan","description":"Structured execution plan: navigate→click/type/select/press/hover/wait/eval/extract/go_back/tabs/snapshot. Validates syntax without eagerly resolving post-navigation targets. Additive — single-action browser_* tools remain.","inputSchema":{"type":"object","properties":{"plan":{"type":"object","description":"ExecutionPlan {steps:[{type:'navigate',url},{type:'type',text,selector},{type:'wait',url_contains},{type:'extract',selector}] }"},"steps":{"type":"array","description":"alias for plan.steps"}},"required":[]}},
-        {"name":"hint_snapshot","description":"Hint-key: scan DOM for clickable/typeable elements and overlay labels A S D F etc. Returns {hints:[{label,tag,role,name,rect,selector,text}]}. Add target to pick tab without focusing: 1-based index, targetId, or url/title substring (e.g. '1', 'excalidraw', 'google.com')","inputSchema":{"type":"object","properties":{"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring (e.g. '1', 'excalidraw', 'google.com')"}},"required":[]}},
-        {"name":"hint_click","description":"Hint-key: click element by label from hint_snapshot (e.g. A). Add target to pick tab without focusing.","inputSchema":{"type":"object","properties":{"label":{"type":"string","description":"hint label like A or AA"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":["label"]}},
-        {"name":"hint_type","description":"Hint-key: focus element by label and type text. Add target to pick tab without focusing.","inputSchema":{"type":"object","properties":{"label":{"type":"string"},"text":{"type":"string"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":["label","text"]}},
-        {"name":"hint_act","description":"Vimium-primary: hint_act in one call - snapshot+heuristic/LLM pick+click/type, vision last resort if no hints. instruction e.g. 'click login button'","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string","description":"click|type|fill"},"text":{"type":"string"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":["instruction"]}},
-        {"name":"hint_batch","description":"Vimium-primary parallel batch: one snapshot + batched LLM + parallel hint_click/type. steps [{instruction,action,text}] max 12, kept screenshot+vision fallback per-step if no hints","inputSchema":{"type":"object","properties":{"steps":{"type":"array","items":{"type":"object"}},"target":{"type":"string","description":"Target tab for all steps: 1-based index, targetId, or url/title substring"}},"required":["steps"]}},
-        {"name":"hint_clear","description":"Clear hint overlay","inputSchema":{"type":"object","properties":{"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"}},"required":[]}},
-        {"name":"excalidraw_open","description":"Excalidraw: ensure https://excalidraw.com is open (lightning: creates tab if needed)","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"optional url default https://excalidraw.com/"}},"required":[]}},
-        {"name":"excalidraw_get_scene","description":"Excalidraw: get current scene elements + appState (counts, bbox)","inputSchema":{"type":"object","properties":{}}},
-        {"name":"excalidraw_clear","description":"Excalidraw: clear canvas (remove all elements) — instant via updateScene","inputSchema":{"type":"object","properties":{}}},
-        {"name":"excalidraw_draw","description":"Excalidraw lightning draw single primitive: {type: rectangle|ellipse|diamond|arrow|line|text|freedraw|frame|stickynote, x,y,width,height,x2,y2,text,label,strokeColor,backgroundColor,fillStyle,strokeWidth,points,name,children} — instant via excalidrawAPI.updateScene (<120ms)","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"rectangle|ellipse|diamond|arrow|line|text|freedraw|frame|stickynote"},"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number"},"height":{"type":"number"},"x2":{"type":"number"},"y2":{"type":"number"},"text":{"type":"string"},"label":{"type":"string"},"strokeColor":{"type":"string"},"backgroundColor":{"type":"string"},"fillStyle":{"type":"string"},"json":{"type":"string","description":"alt: full JSON opts string"}},"required":[]}},
-        {"name":"excalidraw_draw_batch","description":"Excalidraw lightning batch draw: array of primitives [{type,x,y,width,height,text,label,...}] — one updateScene for N elements (~120ms for 50)","inputSchema":{"type":"object","properties":{"elements":{"type":"array","description":"array of primitive JSON objects"},"json":{"type":"string","description":"alt JSON string of array"}},"required":[]}},
-        {"name":"excalidraw_update_scene","description":"Excalidraw: update scene elements directly — {elements:[ExcalidrawElement,...], mode: append|replace} — fastest for complex diagrams","inputSchema":{"type":"object","properties":{"elements":{"type":"array"},"mode":{"type":"string","description":"append|replace default append"},"json":{"type":"string"}},"required":[]}},
-        {"name":"excalidraw_diagram","description":"Excalidraw lightning diagrams: kind flowchart|sequence|microservices|architecture|aws|3tier|network|er|custom — params {title, services, databases, participants, messages, nodes, entities, elements} — auto-layout + arrows + fit","inputSchema":{"type":"object","properties":{"kind":{"type":"string","description":"flowchart|sequence|microservices|architecture|aws|3tier|network|er|custom"},"params":{"type":"object","description":"{title, services:[], databases:[], participants:[], messages:[], nodes:[], entities:[], steps:[], elements:[]}"},"title":{"type":"string"},"json":{"type":"string"}},"required":["kind"]}},
-        {"name":"excalidraw_export","description":"Excalidraw export: {format: png|svg|clipboard, background:bool, dark:bool, embedScene:bool, scale:1|2|3} — uses canvas toDataURL / triggers download","inputSchema":{"type":"object","properties":{"format":{"type":"string"},"background":{"type":"boolean"},"dark":{"type":"boolean"},"embedScene":{"type":"boolean"},"scale":{"type":"integer"}},"required":[]}},
-        {"name":"excalidraw_save","description":"Excalidraw: trigger Save to file (.excalidraw JSON) download + return JSON length","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"suggested path default /tmp/excalidraw-scene.excalidraw"}},"required":[]}},
-        {"name":"excalidraw_view","description":"Excalidraw viewport: get or set {scrollX,scrollY,zoom:{value},viewBackgroundColor,theme,gridModeEnabled} — empty args = get","inputSchema":{"type":"object","properties":{"json":{"type":"string","description":"JSON view patch or empty for get"},"scrollX":{"type":"number"},"scrollY":{"type":"number"},"zoom":{"type":"number"}},"required":[]}},
+        {"name":"browser_execute_plan","description":"Run a structured multi-step browser plan in one call: {steps:[{action: navigate|click|type|select|press|hover|wait|eval|extract, ...}]}. Cheaper and more reliable than N separate browser_* calls.","inputSchema":{"type":"object","properties":{"steps":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string"},"url":{"type":"string"},"selector":{"type":"string"},"ref":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},"js":{"type":"string"},"time":{"type":"number"}},"required":["action"]},"description":"Ordered plan steps"},"plan":{"type":"object","description":"Alternative: wrap the plan as {steps:[...]}"},"target":{"type":"string"}},"required":[]}},
+
+        {"name":"decide","description":"Unified Decider-2B: single or multiple questions, options (or auto-detect yes/no/uncertain), optional image (path/base64/data URI/auto-screenshot), context. Single command covering decide, batch, choose, classify, and detect.","inputSchema":{"type":"object","properties":{"context":{"type":"string","description":"Context/state for the decision"},"state":{"type":"string"},"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}}},"description":"Questions: [{question, options: string[]}] 1..255 options each"},"question":{"type":"string","description":"Single question or query"},"query":{"type":"string","description":"Alternative to question"},"options":{"description":"Options array or comma-separated string (defaults to ['yes', 'no', 'uncertain'] if omitted for presence detection)"},"image":{"type":"string","description":"Image file path, base64, or data URI"},"screenshot":{"type":"boolean","description":"Auto-capture screenshot of browser or desktop"},"use_vision":{"type":"boolean","description":"Auto-capture screenshot if true"},"target":{"type":"string","description":"Target browser tab index or window name"},"temperature":{"type":"number"}},"required":[]}},
+        {"name":"decider_batch","description":"Multiple questions same context/screenshot (or requests[] for concurrent batch, bounded 4). Reuses single screenshot + deterministic fallback.","inputSchema":{"type":"object","properties":{"context":{"type":"string"},"questions":{"type":"array"},"requests":{"type":"array","description":"Alternative: [{context, questions, image}] for concurrent batch (max 12)"},"image":{"type":"string"},"temperature":{"type":"number"}},"required":[]}},
+        {"name":"find","description":"Semantic target resolver: query -> DOM/AX/hints -> candidate filtering -> Decider if ambiguous -> resolved candidate metadata (target-aware, image pipeline reused)","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Natural query e.g. 'Submit button'"},"instruction":{"type":"string"},"description":{"type":"string"},"target":{"type":"string","description":"Target tab: 1-based index, targetId, or url/title substring"},"use_vision":{"type":"boolean"},"vision":{"type":"boolean"},"image":{"type":"string"},"context":{"type":"string"},"viewport":{"type":"object"}},"required":["query"]}},
+        {"name":"choose","description":"Choose: question+options[] up to 255, numeric IDs internally when visual candidates, return selected + confidence + probs + runner_up/margin","inputSchema":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"context":{"type":"string"},"image":{"type":"string"},"target":{"type":"string"},"use_vision":{"type":"boolean"},"vision":{"type":"boolean"},"candidates":{"type":"array"}},"required":["question","options"]}},
+        {"name":"classify","description":"State classification from explicit options, image optional (choose alias for state)","inputSchema":{"type":"object","properties":{"question":{"type":"string"},"query":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"context":{"type":"string"},"image":{"type":"string"}},"required":["question"]}},
+        {"name":"detect","description":"Presence/absence YES/NO/UNCERTAIN (Decider yes/no/uncertain + DOM fallback)","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"question":{"type":"string"},"context":{"type":"string"},"image":{"type":"string"},"use_vision":{"type":"boolean"}},"required":["query"]}},
+        {"name":"identify","description":"Which candidate/entity — identify among candidates (query + hints/candidates, vision 10/text 255)","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"candidates":{"type":"array"},"hints":{"type":"array"},"target":{"type":"string"},"use_vision":{"type":"boolean"}},"required":["query"]}},
+        {"name":"visual_target","description":"Visual target: description+image+candidate rects/metadata -> selected candidate ID/confidence/probs/rect (vision 10 budget, annotated screenshot)","inputSchema":{"type":"object","properties":{"description":{"type":"string"},"query":{"type":"string"},"candidates":{"type":"array","description":"[{id,label,tag,role,name,rect:{x,y,width,height},selector}]"},"hints":{"type":"array"},"image":{"type":"string","description":"base64/data URI; captured via browser/monitor pipeline if omitted"},"target":{"type":"string"}},"required":["description","candidates"]}},
+        {"name":"verify","description":"Verify (DOM first, Decider visual only when necessary) -> success/failure/uncertain + confidence","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+        {"name":"verify_element","description":"Verify element (candidate/selector) present/visible (DOM + visual fallback)","inputSchema":{"type":"object","properties":{"candidate":{"type":"object"},"selector":{"type":"string"}},"required":[]}},
+        {"name":"verify_action","description":"Verify action succeeded (query + expected text)","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"expected":{"type":"string"}},"required":["query"]}},
+        {"name":"wait_until","description":"Wait until predicate via DOM/AX polling + visual fallback, timeout/interval","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"timeout_ms":{"type":"integer"},"timeout":{"type":"integer"},"interval_ms":{"type":"integer"},"interval":{"type":"integer"}},"required":["query"]}},
+        {"name":"observe_state","description":"Observe state: classify current UI state from explicit options (image optional)","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"states":{"type":"array","items":{"type":"string"}},"context":{"type":"string"},"image":{"type":"string"},"target":{"type":"string"}},"required":["query"]}},
+        // ---- Hint pipeline (fast-ground) ----
+        // hint_act is the PRIMARY browser-interaction tool: it takes one natural-language
+        // instruction and resolves the element itself (heuristic -> Decider-2B -> vision).
+        // A planner that executes BLIND should prefer it over browser_click/browser_type,
+        // which require a ref/selector obtained from an observation it will never make.
+        {"name":"hint_act","description":"PRIMARY browser interaction. Give ONE natural-language instruction; it snapshots clickable elements, resolves the target itself (heuristic -> Decider-2B -> vision last resort), then clicks or types. Use this instead of browser_click/browser_type when you have no snapshot ref. Returns tier, label, success.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string","description":"e.g. 'click the first video result' or 'type despacito into the search box'"},"action":{"type":"string","description":"click|type (default click)"},"text":{"type":"string","description":"Text to type when action=type; omit to extract it from the instruction"},"target":{"type":"string","description":"Tab selector: 1-based index, targetId, or url/title substring"}},"required":["instruction"]}},
+        {"name":"hint_batch","description":"Batch hint actions: ONE snapshot, resolve all instructions, dispatch in parallel (max 12 steps). Each step {instruction, action, text}. Cheaper than repeated hint_act.","inputSchema":{"type":"object","properties":{"steps":{"type":"array","description":"[{instruction, action:click|type, text}]"},"target":{"type":"string"}},"required":["steps"]}},
+        {"name":"hint_snapshot","description":"List all clickable/typeable elements on the page as letter keys (A, S, D, ... AA, AS). Use with hint_click/hint_type. Prefer hint_act, which does snapshot+resolve+act in one call.","inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":[]}},
+        {"name":"hint_click","description":"Click the element carrying a hint_snapshot label (e.g. 'A'). Only after hint_snapshot; prefer hint_act which skips the manual label step.","inputSchema":{"type":"object","properties":{"label":{"type":"string","description":"Hint label from hint_snapshot, e.g. 'A' or 'AS'"},"target":{"type":"string"}},"required":["label"]}},
+        {"name":"hint_type","description":"Type text into the element carrying a hint_snapshot label. Only after hint_snapshot; prefer hint_act with action=type.","inputSchema":{"type":"object","properties":{"label":{"type":"string","description":"Hint label from hint_snapshot"},"text":{"type":"string"},"target":{"type":"string"}},"required":["label","text"]}},
+        {"name":"hint_clear","description":"Remove the hint key overlay from the page (labels stay in the DOM).","inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":[]}},
+        {"name":"ground","description":"Visual grounding fallback: screenshot + Decider candidate ranking -> {x,y} global logical coords, for canvas/WebGL pages with no DOM hints. Then click with pointer.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"window":{"type":"string"},"region":{"type":"string"}},"required":["instruction"]}},
+        {"name":"act_fast","description":"Fused ground+click/type in one call (no extra round trip). Use when hint_act cannot resolve because the page has no DOM hints.","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"action":{"type":"string","description":"click|type (default click)"},"text":{"type":"string"},"window":{"type":"string"}},"required":["instruction"]}},
+        {"name":"act_batch","description":"Batch fused steps: JSON array [{instruction, action, text}] resolved and dispatched together.","inputSchema":{"type":"object","properties":{"steps":{"type":"array"},"window":{"type":"string"}},"required":[]}},
+        {"name":"hint_resolve","description":"Hint resolve: hint_snapshot -> Decider -> hint_click (single instruction, target-aware, deterministic fallback, vision optional)","inputSchema":{"type":"object","properties":{"instruction":{"type":"string"},"query":{"type":"string"},"target":{"type":"string"},"use_vision":{"type":"boolean"},"vision":{"type":"boolean"}},"required":["instruction"]}},
+        {"name":"hint_resolve_batch","description":"Hint resolve batch: multiple instructions same snapshot/screenshot, batched Decider (max 12, bounded 4)","inputSchema":{"type":"object","properties":{"instructions":{"type":"array","items":{"type":"string"}},"steps":{"type":"array"},"target":{"type":"string"},"use_vision":{"type":"boolean"},"vision":{"type":"boolean"}},"required":["instructions"]}},
+        {"name":"key_identify","description":"Key identify for visual/virtual keyboards (same pipeline, keyboard candidates, target+rect aware)","inputSchema":{"type":"object","properties":{"key":{"type":"string"},"query":{"type":"string"},"target":{"type":"string"},"rect":{"type":"object"},"keyboard_rect":{"type":"object"},"use_vision":{"type":"boolean"}},"required":["key"]}},
+        {"name":"find_and_click","description":"Composite: find + click (semantic find then hint/browser click, target-aware)","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"instruction":{"type":"string"},"target":{"type":"string"},"use_vision":{"type":"boolean"}},"required":["query"]}},
+        {"name":"find_and_type","description":"Composite: find + type (semantic find then hint/browser type, target-aware)","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"instruction":{"type":"string"},"text":{"type":"string"},"target":{"type":"string"},"use_vision":{"type":"boolean"}},"required":["query","text"]}},
+        {"name":"decider_health","description":"Decider health check (GET /health, fallback /v1/health)","inputSchema":{"type":"object","properties":{}}},
+        {"name":"decider_metrics","description":"Decider metrics snapshot (request/success/error/timeout/latency)","inputSchema":{"type":"object","properties":{}}},
         {"name":"categories","description":"Laya Pass-1: list 8 tool categories as {category_name, description} with total count","inputSchema":{"type":"object","properties":{}}},
-        {"name":"category","description":"Laya Pass-2: show category {category_name, description, total_commands, commands:[{command_name, description}]}. category: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw","inputSchema":{"type":"object","properties":{"category":{"type":"string","description":"Category name: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw"}},"required":["category"]}},
+        {"name":"category","description":"Laya Pass-2: show category {category_name, description, total_commands, commands:[{command_name, description}]}. category: core-desktop|perceive|native-act|browser-act|fast-ground|task-memory|draw|perception","inputSchema":{"type":"object","properties":{"category":{"type":"string","description":"Category name: core-desktop|perceive|native-act|browser-act|fast-ground|task-memory|draw|perception"}},"required":["category"]}},
         {"name":"excalidraw_fit","description":"Excalidraw: center viewport on content (zoom to fit) — auto-fits bbox","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in reader.lines() {
@@ -998,83 +1300,9 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
         "browser_open" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let ws = args.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
-            let cmd = format!("brave --remote-debugging-port=9222 --force-renderer-accessibility --new-window {}", url);
-            let rule = if ws.is_empty() { "".to_string() } else { format!("[workspace {} silent] ", ws) };
-            hypr::dispatch("exec", &format!("{}{}", rule, cmd))?;
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            Ok(serde_json::json!({"launched": url}))
+            browser_open_url(url, ws)
         },
-        // ----- Stagehand port -----
-        "stagehand_act" => {
-            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
-            if instruction.is_empty() { anyhow::bail!("stagehand_act needs instruction"); }
-            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let mut cfg = stagehand::StagehandConfig::from_env();
-            if !model.is_empty() { cfg.model_name = model.to_string(); }
-            stagehand::act::act(instruction, &cfg)
-        },
-        "stagehand_observe" => {
-            let instruction = args.get("instruction").and_then(|v| v.as_str());
-            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let mut cfg = stagehand::StagehandConfig::from_env();
-            if !model.is_empty() { cfg.model_name = model.to_string(); }
-            stagehand::observe::observe(instruction, &cfg)
-        },
-        "stagehand_extract" => {
-            let instruction = args.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
-            let schema_str = args.get("schema").and_then(|v| v.as_str()).unwrap_or("");
-            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let mut cfg = stagehand::StagehandConfig::from_env();
-            if !model.is_empty() { cfg.model_name = model.to_string(); }
-            let schema: Option<Value> = if schema_str.is_empty() { None } else { serde_json::from_str(schema_str).ok() };
-            stagehand::extract::extract(instruction, schema.as_ref(), &cfg)
-        },
-        "stagehand_agent" => {
-            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
-            if goal.is_empty() { anyhow::bail!("stagehand_agent needs goal"); }
-            let max_steps = args.get("max_steps").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-            let model = args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let mut cfg = stagehand::StagehandConfig::from_env();
-            if !model.is_empty() { cfg.model_name = model.to_string(); }
-            stagehand::agent::execute(goal, &cfg, max_steps)
-        },
-        "stagehand_snapshot" => {
-            let snap = stagehand::snapshot::capture_hybrid()?;
-            Ok(serde_json::json!({"combined_tree": snap.combined_tree, "xpath_map": snap.combined_xpath_map, "via": snap.via, "raw_nodes": snap.raw_ax_nodes}))
-        },
-        "stagehand_cache" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
-            match action {
-                "clear" => stagehand::cache::clear_cache(),
-                _ => Ok(stagehand::cache::cache_status()),
-            }
-        },
-        "stagehand_metrics" => Ok(stagehand::instrumentation::METRICS.snapshot()),
-        "stagehand_batch" => {
-            let src = args.get("callbackSource").or_else(|| args.get("callback_source")).and_then(|v| v.as_str()).unwrap_or("");
-            let input = args.get("input").cloned();
-            let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000) as u32;
-            stagehand::batch::experimental_batch(src, input, timeout)
-        },
-        "stagehand_webmcp" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
-            match action {
-                "invoke" => {
-                    let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                    let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
-                    stagehand::webmcp::invoke_tool("", tool, input)
-                },
-                _ => Ok(serde_json::json!({"tools": stagehand::webmcp::list_tools("")?})),
-            }
-        },
-        "context_pages" => stagehand::context::pages(),
-        "context_cookies" => Ok(serde_json::json!({"cookies": stagehand::cookies::get_cookies()?})),
-        "cookies_set" => {
-            let cs = args.get("cookies").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            stagehand::cookies::set_cookies(cs)?; Ok(serde_json::json!({"ok": true}))
-        },
-        "clipboard_write" => { let t = args.get("text").and_then(|v| v.as_str()).unwrap_or(""); stagehand::clipboard::write_text(t)?; Ok(serde_json::json!({"ok": true})) },
-        "clipboard_read" => Ok(serde_json::json!({"text": stagehand::clipboard::read_text()?})),
+
         "task_init" => {
             let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
             if goal.is_empty() { anyhow::bail!("task_init needs goal"); }
@@ -1145,14 +1373,12 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let target = args.get("target").and_then(|v| v.as_str());
-            let cfg = stagehand::StagehandConfig::from_env();
-            hint::hint_act_with_target(instruction, action, text, &cfg, target)
+            hint::hint_act_with_target(instruction, action, text, target)
         },
         "hint_batch" => {
             let steps = args.get("steps").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| args.as_array().cloned().unwrap_or_default());
             let target = args.get("target").and_then(|v| v.as_str());
-            let cfg = stagehand::StagehandConfig::from_env();
-            hint::hint_batch_with_target(&steps, &cfg, target)
+            hint::hint_batch_with_target(&steps, target)
         },
         "hint_clear" => {
             let target = args.get("target").and_then(|v| v.as_str());
@@ -1224,10 +1450,35 @@ fn handle_tool(name: &str, args: Value) -> Result<Value> {
             } else { excalidraw::get_view() }
         },
         "excalidraw_fit" => excalidraw::scroll_to_content(),
+        // ----- Perception / Decider-2B semantic tools (reuse perception resolver, single image pipeline, target-aware, bounded 4, deterministic fallback) -----
+        "decide" => decider::tools::decide(args),
+        "decider_batch" => decider::tools::decider_batch(args),
+        "find" => decider::tools::find(args),
+        "choose" => decider::tools::choose(args),
+        "classify" => decider::tools::classify(args),
+        "detect" => decider::tools::detect(args),
+        "identify" => decider::tools::identify(args),
+        "visual_target" => decider::tools::visual_target(args),
+        "verify" => decider::tools::verify(args),
+        "verify_element" => decider::tools::verify_element(args),
+        "verify_action" => decider::tools::verify_action(args),
+        "wait_until" => decider::tools::wait_until(args),
+        "observe_state" => decider::tools::observe_state(args),
+        "hint_resolve" => decider::tools::hint_resolve(args),
+        "hint_resolve_batch" => decider::tools::hint_resolve_batch(args),
+        "key_identify" => decider::tools::key_identify(args),
+        "find_and_click" => decider::tools::find_and_click(args),
+        "find_and_type" => decider::tools::find_and_type(args),
+        "decider_health" => {
+            let cfg = decider::config::DeciderConfig::from_env();
+            let client = decider::client::DeciderClient::new(cfg)?;
+            Ok(client.health_sync()?)
+        },
+        "decider_metrics" => Ok(decider::client::metrics().snapshot()),
         "categories" => Ok(laya_categories_value()),
         "category" => {
             let cat = args.get("category").or_else(|| args.get("name")).and_then(|v| v.as_str()).unwrap_or("");
-            if cat.is_empty() { anyhow::bail!("category needs category name: core-desktop|perceive|native-act|browser-act|smart-llm|fast-ground|task-memory|draw"); }
+            if cat.is_empty() { anyhow::bail!("category needs category name: core-desktop|perceive|native-act|browser-act|fast-ground|task-memory|draw|perception"); }
             // returns {category_name, description, total_commands, commands:[{command_name, description}]}
             laya_category_value(cat)
         },

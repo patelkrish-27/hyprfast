@@ -1,6 +1,6 @@
 # Excalidraw Deep Capture — 2026-09-10
 
-> Source: live https://excalidraw.com/ (version `2026-09-10T14:45:37Z-afa3a65`) via hyprfast CDP + stagehand. All data verified against real browser, not mocked.
+> Source: live https://excalidraw.com/ (version `2026-09-10T14:45:37Z-afa3a65`) via hyprfast CDP. All data verified against real browser, not mocked.
 
 ## 1. Shortcuts (full HelpDialog, 80 entries)
 

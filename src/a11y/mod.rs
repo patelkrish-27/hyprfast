@@ -73,7 +73,6 @@ pub fn click_by_name(window: &str, name: &str) -> Result<Value> {
                 obj.insert("tier".into(), Value::String("a11y".into()));
             }
         }
-        crate::stagehand::instrumentation::METRICS.record_tier("a11y");
         return Ok(v);
     }
     let els = list_elements(window, name)?;
@@ -81,9 +80,7 @@ pub fn click_by_name(window: &str, name: &str) -> Result<Value> {
     if arr.is_empty() {
         // 1. a11y found nothing — 2. try hint-key middle tier before falling back to vision pointer
         let hint_attempt = (|| -> Result<Value> {
-            let cfg = crate::stagehand::StagehandConfig::from_env();
-            let (res, label) = crate::hint::try_hint_tier(name, "click", "", &cfg)?;
-            crate::stagehand::instrumentation::METRICS.record_tier("hint");
+            let (res, label) = crate::hint::try_hint_tier(name, "click", "", None)?;
             Ok(serde_json::json!({"clicked": true, "via": "hint", "label": label, "tier": "hint", "result": res}))
         })();
         if let Ok(v) = hint_attempt {
@@ -134,7 +131,6 @@ print(json.dumps({{"clicked": True, "x": {x}, "y": {y}, "via": "DoAction" if cli
     let mut v: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
     let via = v.get("via").and_then(|x| x.as_str()).unwrap_or("");
     if via == "DoAction" {
-        crate::stagehand::instrumentation::METRICS.record_tier("a11y");
         if v.is_object() {
             if let Some(obj) = v.as_object_mut() { obj.insert("tier".into(), Value::String("a11y".into())); }
         }
@@ -143,16 +139,13 @@ print(json.dumps({{"clicked": True, "x": {x}, "y": {y}, "via": "DoAction" if cli
     // DoAction failed -> fell back to pointer (2nd tier would be hint before vision)
     // Try hint middle tier before returning pointer vision fallback
     let hint_attempt = (|| -> Result<Value> {
-        let cfg = crate::stagehand::StagehandConfig::from_env();
-        let (res, label) = crate::hint::try_hint_tier(name, "click", "", &cfg)?;
-        crate::stagehand::instrumentation::METRICS.record_tier("hint");
+        let (res, label) = crate::hint::try_hint_tier(name, "click", "", None)?;
         Ok(serde_json::json!({"clicked": true, "via": "hint", "label": label, "tier": "hint", "result": res, "fallback_from": v}))
     })();
     if let Ok(hv) = hint_attempt {
         return Ok(hv);
     }
     // hint also failed -> pointer was already the vision-ish fallback; record as vision for distribution
-    crate::stagehand::instrumentation::METRICS.record_tier("vision");
     if v.is_object() {
         if let Some(obj) = v.as_object_mut() { obj.insert("tier".into(), Value::String("vision".into())); }
     }

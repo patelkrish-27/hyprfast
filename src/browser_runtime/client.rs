@@ -310,7 +310,28 @@ pub async fn try_evaluate_via_daemon(expression: &str) -> Option<RuntimeResult<V
 /// Generic helpers for Phase 3 migration: sync wrappers that try the daemon first,
 /// falling back to an ephemeral BrowserRuntime (single WS) when no daemon is alive.
 /// This keeps the WebSocket connect confined to `connection.rs` even on the degraded path.
-fn rt_block_on<F: std::future::Future>(f: F) -> F::Output {
+fn rt_block_on<F: std::future::Future + Send>(f: F) -> F::Output
+where
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Already inside a runtime (e.g. decider/hint_resolve sync wrappers
+        // that drove an async helper with their own rt_block_on): block_on
+        // here would panic "Cannot start a runtime from within a runtime".
+        // Run the future on a helper thread with its own runtime instead —
+        // the future only talks to the daemon socket, never the outer runtime.
+        return std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("client sync runtime (helper)")
+                    .block_on(f)
+            })
+            .join()
+            .expect("client rt_block_on helper thread")
+        });
+    }
     // Reuse a current-thread runtime for CLI sync contexts; cheap to create per call for Phase 3.
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -427,7 +448,7 @@ async fn try_devtools_proxy_for_cdp(method: &str, params: &Value) -> Option<Runt
     }
 }
 
-/// Sync wrapper for `try_cdp_call_via_daemon` (for sync browser/stagehand helpers).
+/// Sync wrapper for `try_cdp_call_via_daemon` (for sync browser helpers).
 pub fn cdp_call_sync(
     method: &str,
     params: Value,

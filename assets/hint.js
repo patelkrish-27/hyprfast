@@ -146,6 +146,12 @@
       out.push({
         label: label,
         tag: tag,
+        // `type` is what separates a real text field from `input[type=submit]`,
+        // `input[type=button]`, `input[type=file]` and friends. Without it a
+        // caller cannot tell them apart: on Google's home page a type action
+        // landed in a hidden `input[type=submit]` search suggestion, reported
+        // "typed: 16", and the text never reached the search box.
+        type: (el.getAttribute('type') || '').toLowerCase(),
         role: roleFor(el, tag),
         name: textFor(el) || tag,
         rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
@@ -175,10 +181,29 @@
     return {clicked:true, label: label, tag: el.tagName};
   }
 
+  // An input can be visible and still be unable to receive text: `submit`,
+  // `button`, `reset`, `file`, `image`, `checkbox` and `radio` are buttons or
+  // pickers wearing the `input` tag. Setting `.value` on one "succeeds" and
+  // changes nothing a user can see.
+  function isTextEntry(el) {
+    if (el.isContentEditable) return true;
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
+    if (el.tagName !== 'INPUT') return false;
+    var t = (el.getAttribute('type') || 'text').toLowerCase();
+    return ['button','submit','reset','checkbox','radio','file','image','range','color'].indexOf(t) === -1;
+  }
+
   function focusAndType(label, text) {
     const el = labelToEl.get(label);
     if (!el) return {error: 'label not found: ' + label};
     if (!document.contains(el)) return {error: 'element detached'};
+    if (!isTextEntry(el)) {
+      return {
+        error: 'element cannot receive typed text (tag=' + el.tagName +
+               ', type=' + (el.getAttribute('type') || 'text') + ')',
+        label: label, tag: el.tagName, typed: 0, editable: false
+      };
+    }
     el.scrollIntoView({block:'center', inline:'center', behavior:'instant'});
     try { el.focus({preventScroll:true}); } catch(e) { el.focus(); }
     if (el.isContentEditable) {
@@ -215,16 +240,18 @@
       el.dispatchEvent(new KeyboardEvent('keydown', {key:'a', bubbles:true}));
       return {typed: text.length, label: label, tag: el.tagName};
     } else {
-      // generic focusable: try to set value if exists or innerText
-      if ('value' in el) {
-        el.value = text;
-        el.dispatchEvent(new Event('input', {bubbles:true}));
-        el.dispatchEvent(new Event('change', {bubbles:true}));
-        return {typed: text.length, label: label, tag: el.tagName, via:'value'};
-      } else {
-        el.textContent = text;
-        return {typed: text.length, label: label, tag: el.tagName, via:'textContent'};
-      }
+      // Not an editable element. Overwriting its textContent looks like a
+      // successful type — it reports `typed: 9` — but the text never reaches
+      // a field: it replaces the link's or button's own label, so the caller
+      // believes it typed into the search box while the page was silently
+      // relabelled. Report the mismatch instead of corrupting the page.
+      return {
+        error: 'element is not editable (tag=' + el.tagName + ', role=' + (el.getAttribute('role') || 'none') + '); it cannot receive typed text',
+        label: label,
+        tag: el.tagName,
+        typed: 0,
+        editable: false
+      };
     }
   }
 

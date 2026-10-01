@@ -25,6 +25,12 @@ fn cdp_base_url() -> String {
     format!("http://{}:{}", host, port)
 }
 
+pub fn base_url() -> String { cdp_base_url() }
+
+pub fn port() -> u16 {
+    std::env::var("HYPRFAST_CDP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT)
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Target {
     pub id: String,
@@ -120,6 +126,23 @@ pub async fn list_targets_filtered_async(typ: Option<&str>) -> Result<Vec<Target
         Ok(all.into_iter().filter(|x| x.typ==t).collect())
     } else { Ok(all) }
 }
+
+pub async fn endpoint_version_async() -> Result<Value> {
+    let base = cdp_base_url();
+    let url = format!("{}/json/version", base);
+    let client = reqwest::Client::builder().timeout(Duration::from_millis(1500)).build()?;
+    let resp = client.get(&url).send().await.map_err(|e| anyhow::anyhow!("CDP unreachable at {url} ({e})"))?;
+    if !resp.status().is_success() { bail!("CDP GET /json/version failed: {}", resp.status()); }
+    let v: Value = resp.json().await.context("parse /json/version")?;
+    Ok(v)
+}
+
+pub fn endpoint_version() -> Result<Value> { tokio_block_on(endpoint_version_async()) }
+
+/// Whether a real browser is already serving CDP on the configured endpoint.
+pub fn probe() -> bool { endpoint_version().is_ok() }
+
+pub fn targets_http() -> Result<Vec<Target>> { tokio_block_on(list_targets_async()) }
 
 pub fn version() -> Result<Value> {
     // Prefer DevTools MCP path via proxy's evaluate? But Browser.getVersion is not a proxy tool.

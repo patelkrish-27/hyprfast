@@ -1,5 +1,5 @@
 //! Hint-key content script — standalone overlay for clickable/typeable elements.
-//! Milestone 2: not yet wired into stagehand fallback chain (that's Milestone 3).
+//! Primary resolver: hint_snapshot -> choose/decide -> hint_click/hint_type.
 //! Injection via Runtime.evaluate / Page.addScriptToEvaluateOnNewDocument
 //! through the devtools proxy or browser_runtime client. Exposes
 //! `window.__hyprfastHint { snapshot(), click(label), focusAndType(label,text) }`
@@ -333,67 +333,41 @@ pub fn heuristic_hint_match(instruction: &str, hints_val: &Value) -> Option<Stri
     None
 }
 
-/// LLM-based hint label resolution. Returns label if LLM finds a match.
-pub fn llm_hint_match(instruction: &str, hints_val: &Value, cfg: &crate::stagehand::StagehandConfig) -> Result<Option<String>> {
-    if cfg.api_key.is_empty() {
-        return Ok(None);
-    }
-    let arr = hints_val.get("hints").and_then(|v| v.as_array())
-        .or_else(|| hints_val.as_array())
-        .cloned().unwrap_or_default();
-    if arr.is_empty() { return Ok(None); }
-    // Build compact hint listing for LLM
-    let listing: Vec<Value> = arr.iter().take(60).map(|h| {
-        json!({
-            "label": h.get("label"),
-            "role": h.get("role"),
-            "name": h.get("name"),
-            "tag": h.get("tag"),
-            "selector": h.get("selector"),
-            "text": h.get("text"),
-        })
-    }).collect();
-    let hints_json = serde_json::to_string(&listing).unwrap_or_default();
-    let system = crate::stagehand::prompt::ChatMessage {
-        role: "system".into(),
-        content: Value::String("You map a natural-language browser action to a hint label. Given a list of DOM elements annotated with hint labels (single letters like A, S, D), return JSON {\"label\": \"X\"} where X is the best matching label for the instruction, or {\"label\": null} if no element matches. Prefer exact text/name matches; consider role (button/link/input). Return ONLY JSON.".into()),
-    };
-    let user = crate::stagehand::prompt::ChatMessage {
-        role: "user".into(),
-        content: Value::String(format!("Instruction: {}\nHints: {}", instruction, hints_json)),
-    };
-    let llm_cfg = crate::stagehand::llm::LlmConfig::from_parts(&cfg.model_name, &cfg.api_key);
-    let resp = crate::stagehand::llm::generate(vec![system, user], &llm_cfg, true)?;
-    crate::stagehand::instrumentation::METRICS.add("act", &resp);
-    if let Some(l) = resp.get("label").and_then(|v| v.as_str()) {
-        if !l.is_empty() { return Ok(Some(l.to_string())); }
-    }
-    // also handle nested
-    if let Some(l) = resp.get("hint").and_then(|v| v.as_str()) {
-        if !l.is_empty() { return Ok(Some(l.to_string())); }
-    }
-    Ok(None)
+/// Resolve a hint label through deterministic matching, then Decider selection.
+pub fn resolve_hint_for_instruction(instruction: &str, hints_val: &Value, target: Option<&str>) -> Option<String> {
+    resolve_hint_with_candidates(instruction, hints_val, target, None)
 }
 
-/// Resolve hint label for instruction: heuristic fast-path, then LLM if needed.
-pub fn resolve_hint_for_instruction(instruction: &str, hints_val: &Value, cfg: &crate::stagehand::StagehandConfig) -> Option<String> {
+/// [`resolve_hint_for_instruction`] with a pre-filtered candidate set.
+///
+/// The Decider tier re-collects candidates from the live page when the context
+/// carries none, so a caller that has already narrowed the field (a type action
+/// must not land on a link) has to hand the narrowed set over explicitly —
+/// otherwise the second tier silently widens the search back to the full page
+/// and undoes the filter.
+pub fn resolve_hint_with_candidates(
+    instruction: &str,
+    hints_val: &Value,
+    target: Option<&str>,
+    candidates: Option<crate::decider::Candidates>,
+) -> Option<String> {
     if let Some(label) = heuristic_hint_match(instruction, hints_val) {
         return Some(label);
     }
-    match llm_hint_match(instruction, hints_val, cfg) {
-        Ok(Some(l)) => Some(l),
-        _ => None,
-    }
+    let mut ctx = crate::perception::ResolveContext::new(instruction);
+    if let Some(target) = target { ctx = ctx.with_target(target); }
+    if let Some(c) = candidates { ctx = ctx.with_candidates(c); }
+    crate::perception::resolve_target(instruction, &ctx).ok().and_then(|r| r.label)
 }
 
 /// Try hint tier for instruction. Returns Ok((Value, label)) on success.
-pub fn try_hint_tier(instruction: &str, method: &str, type_text: &str, cfg: &crate::stagehand::StagehandConfig) -> Result<(Value, String)> {
+pub fn try_hint_tier(instruction: &str, method: &str, type_text: &str, target: Option<&str>) -> Result<(Value, String)> {
     let hints = hint_snapshot()?;
     let count = hints.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
     if count == 0 {
         bail!("hint tier: no hints (canvas/custom-drawn, fallback to vision)");
     }
-    let label = resolve_hint_for_instruction(instruction, &hints, cfg)
+    let label = resolve_hint_for_instruction(instruction, &hints, target)
         .ok_or_else(|| anyhow::anyhow!("hint tier: no label matches instruction {:?}", instruction))?;
     let is_type = matches!(method, "fill" | "type" | "type_text");
     let res = if is_type {
@@ -449,14 +423,13 @@ pub fn hint_clear_with_target(target: Option<&str>) -> Result<Value> {
 
 /// Vimium-primary single action: snapshot once -> resolve label -> click/type.
 /// This is the fast path: no AX tree, no screenshot. Falls back to vision if hint empty.
-pub fn hint_act(instruction: &str, method: &str, type_text: &str, cfg: &crate::stagehand::StagehandConfig) -> Result<Value> {
-    hint_act_with_target(instruction, method, type_text, cfg, None)
+pub fn hint_act(instruction: &str, method: &str, type_text: &str) -> Result<Value> {
+    hint_act_with_target(instruction, method, type_text, None)
 }
 pub fn hint_act_with_target(
     instruction: &str,
     method: &str,
     type_text: &str,
-    cfg: &crate::stagehand::StagehandConfig,
     target: Option<&str>,
 ) -> Result<Value> {
     let hints = hint_snapshot_with_target(target)?;
@@ -465,66 +438,91 @@ pub fn hint_act_with_target(
         // No DOM candidates -> vision last resort (keep screenshot+vision if nothing works)
         return try_vision_tier(instruction, method, type_text, "");
     }
-    if let Some(label) = resolve_hint_for_instruction(instruction, &hints, cfg) {
-        let is_type = matches!(method, "fill" | "type" | "type_text");
+    let is_type = matches!(method, "fill" | "type" | "type_text");
+    // A type instruction resolved against the full page lands on whatever
+    // matches its wording best, which is very often a link or a row rather
+    // than a field — "type despacito into the search box" was matching a
+    // result link whose text mentioned despacito. Typing there overwrote the
+    // element's own label and still reported success, so the caller moved on
+    // believing the text had been entered. For a type action the editable
+    // elements are the only sane candidates, so they go first.
+    if is_type {
+        if let Some(label) = editable_only_hints(&hints).and_then(|e| {
+            // The narrowed set has to reach the Decider tier too, or it
+            // re-collects from the page and picks the link again. A single
+            // editable element needs no model at all — there is nothing to
+            // choose between, and the Decider rejects a one-option question.
+            let cands = crate::decider::Candidates::from_hint_snapshot(&e, None, None, None);
+            if cands.len() == 1 {
+                cands.iter().next().map(|c| c.label.clone())
+            } else {
+                resolve_hint_with_candidates(instruction, &e, target, Some(cands))
+            }
+        }) {
+            let txt = if type_text.is_empty() { extract_target_hint(instruction) } else { type_text.to_string() };
+            let res = hint_type_with_target(&label, &txt, target)?;
+            return Ok(json!({"success": true, "tier": "hint", "label": label, "via": "hint_act", "result": res, "count": count}));
+        }
+    }
+    if let Some(label) = resolve_hint_for_instruction(instruction, &hints, target) {
         let res = if is_type {
             let txt = if type_text.is_empty() { extract_target_hint(instruction) } else { type_text.to_string() };
             hint_type_with_target(&label, &txt, target)?
         } else {
             hint_click_with_target(&label, target)?
         };
-        crate::stagehand::instrumentation::METRICS.record_tier("hint");
         return Ok(json!({"success": true, "tier": "hint", "label": label, "via": "hint_act", "result": res, "count": count}));
     }
     // No label matched -> try vision as last resort per user preference
     try_vision_tier(instruction, method, type_text, "")
 }
 
-/// Batch LLM resolver: one LLM call returns labels for N instructions.
-fn llm_hint_match_batch(instructions: &[String], hints_val: &Value, cfg: &crate::stagehand::StagehandConfig) -> Result<Vec<Option<String>>> {
-    if cfg.api_key.is_empty() {
-        return Ok(vec![None; instructions.len()]);
+/// The subset of a `hint_snapshot` payload that can actually receive typed
+/// text: `input` (excluding button-ish and checkbox types), `textarea`,
+/// `select`, and anything `contenteditable`.
+///
+/// A type instruction is frequently phrased against a *place* ("the search
+/// box") while the resolver's best lexical match on the page is a link whose
+/// text mentions search. Restricting the candidates to editable elements is
+/// what keeps `type X into the search box` from landing on a result link.
+fn editable_only_hints(hints_val: &Value) -> Option<Value> {
+    let hints = hints_val.get("hints")?.as_array()?;
+    let editable: Vec<&Value> = hints.iter().filter(|h| hint_is_editable(h)).collect();
+    if editable.is_empty() {
+        return None;
     }
-    let arr = hints_val.get("hints").and_then(|v| v.as_array())
-        .or_else(|| hints_val.as_array())
-        .cloned().unwrap_or_default();
-    if arr.is_empty() { return Ok(vec![None; instructions.len()]); }
-    let listing: Vec<Value> = arr.iter().take(60).map(|h| json!({
-        "label": h.get("label"), "role": h.get("role"), "name": h.get("name"),
-        "tag": h.get("tag"), "selector": h.get("selector"), "text": h.get("text"),
-    })).collect();
-    let hints_json = serde_json::to_string(&listing).unwrap_or_default();
-    let instr_json = serde_json::to_string(instructions).unwrap_or_default();
-    let system = crate::stagehand::prompt::ChatMessage {
-        role: "system".into(),
-        content: Value::String("You map N browser instructions to hint labels. Given hints [{label,role,name,tag,text}] return JSON {\"labels\": [\"A\",\"S\",null]} where index i corresponds to instruction i. Use null if no match. Return ONLY JSON.".into()),
-    };
-    let user = crate::stagehand::prompt::ChatMessage {
-        role: "user".into(),
-        content: Value::String(format!("Instructions: {}\nHints: {}", instr_json, hints_json)),
-    };
-    let llm_cfg = crate::stagehand::llm::LlmConfig::from_parts(&cfg.model_name, &cfg.api_key);
-    let resp = crate::stagehand::llm::generate(vec![system, user], &llm_cfg, true)?;
-    crate::stagehand::instrumentation::METRICS.add("act", &resp);
-    if let Some(labels) = resp.get("labels").and_then(|v| v.as_array()) {
-        let out: Vec<Option<String>> = labels.iter().map(|v| v.as_str().map(|s| s.to_string())).collect();
-        // pad/truncate to instructions len
-        let mut padded = out;
-        padded.resize_with(instructions.len(), || None);
-        padded.truncate(instructions.len());
-        return Ok(padded);
-    }
-    Ok(vec![None; instructions.len()])
+    let mut out = hints_val.clone();
+    out["hints"] = Value::Array(editable.into_iter().cloned().collect());
+    out["count"] = json!(out["hints"].as_array().map(|a| a.len()).unwrap_or(0));
+    Some(out)
 }
 
-/// Vimium-primary parallel batch: one snapshot + one batched LLM call + parallel dispatches.
-/// Keeps screenshot+vision fallback per-step if hint cannot resolve.
-pub fn hint_batch(steps: &[Value], cfg: &crate::stagehand::StagehandConfig) -> Result<Value> {
-    hint_batch_with_target(steps, cfg, None)
+/// True when the hint's element can hold typed text.
+fn hint_is_editable(h: &Value) -> bool {
+    let tag = h.get("tag").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+    if tag == "textarea" || tag == "select" {
+        return true;
+    }
+    if tag != "input" {
+        // `contenteditable` is not in the hint payload, but a non-input element
+        // is only a plausible type target when its selector says so.
+        return h
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("contenteditable"));
+    }
+    match h.get("type").and_then(|v| v.as_str()).unwrap_or("text").to_ascii_lowercase().as_str() {
+        "button" | "submit" | "reset" | "checkbox" | "radio" | "file" | "image" | "range" | "color" => false,
+        _ => true,
+    }
+}
+
+/// Vimium-primary parallel batch: one snapshot + Decider selection + parallel dispatches.
+pub fn hint_batch(steps: &[Value]) -> Result<Value> {
+    hint_batch_with_target(steps, None)
 }
 pub fn hint_batch_with_target(
     steps: &[Value],
-    cfg: &crate::stagehand::StagehandConfig,
     target: Option<&str>,
 ) -> Result<Value> {
     if steps.is_empty() { bail!("hint_batch needs at least 1 step"); }
@@ -550,26 +548,8 @@ pub fn hint_batch_with_target(
 
     // Phase 1: heuristic fast-path per instruction (no LLM)
     let mut labels: Vec<Option<String>> = Vec::with_capacity(instrs.len());
-    let mut need_llm_idx: Vec<usize> = Vec::new();
-    let mut need_llm_instrs: Vec<String> = Vec::new();
     for (i, instr) in instrs.iter().enumerate() {
-        if let Some(l) = heuristic_hint_match(instr, &hints) {
-            labels.push(Some(l));
-        } else {
-            labels.push(None);
-            need_llm_idx.push(i);
-            need_llm_instrs.push(instr.clone());
-        }
-    }
-    // Phase 2: single batched LLM for remaining
-    if !need_llm_instrs.is_empty() {
-        if let Ok(batch_labels) = llm_hint_match_batch(&need_llm_instrs, &hints, cfg) {
-            for (k, idx) in need_llm_idx.iter().enumerate() {
-                if let Some(Some(l)) = batch_labels.get(k).cloned().map(|o| o) {
-                    if !l.is_empty() { labels[*idx] = Some(l); }
-                }
-            }
-        }
+        labels.push(resolve_hint_for_instruction(instr, &hints, target));
     }
     // Phase 3: parallel dispatch via std::thread::scope (CDP transport concurrent, I5 per-target serialization still via server queue)
     let hints_for_threads = &hints;
@@ -594,7 +574,6 @@ pub fn hint_batch_with_target(
                     };
                     match res {
                         Ok(v) => {
-                            crate::stagehand::instrumentation::METRICS.record_tier("hint");
                             json!({"instruction": instr, "label": label, "tier": "hint", "success": true, "result": v})
                         },
                         Err(e) => {

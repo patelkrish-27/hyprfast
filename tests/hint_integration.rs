@@ -1,5 +1,4 @@
 //! Hint-key integration test — real Brave, deterministic labels, clicks land.
-//! Milestone 2: standalone hint layer, not yet wired to stagehand fallback.
 
 use serde_json::Value;
 use std::time::{Duration, Instant};
